@@ -1,0 +1,42 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>e11c9d10-6640-4d5f-b0e5-2cc9c43ab480</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Publish output lives in .\publish — keep it out of the project so each publish doesn't nest the previous one. -->
+    <Compile Remove="publish\**;publish-selfcontained\**" />
+    <Content Remove="publish\**;publish-selfcontained\**" />
+    <None Remove="publish\**;publish-selfcontained\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Auth -->
+    <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.0" />
+
+    <!-- SQL Server persistence -->
+    <PackageReference Include="Dapper" Version="2.1.35" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.1" />
+
+    <!-- Redis: SignalR backplane + distributed lock -->
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="8.0.0" />
+    <PackageReference Include="StackExchange.Redis" Version="2.7.33" />
+
+    <!-- Health checks -->
+    <PackageReference Include="AspNetCore.HealthChecks.SqlServer" Version="8.0.1" />
+    <PackageReference Include="AspNetCore.HealthChecks.Redis" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- RNG -->
+    <Reference Include="EasyRNG">
+      <HintPath>libs\EasyRNG.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

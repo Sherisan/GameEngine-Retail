@@ -1,0 +1,300 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.IdentityModel.Tokens;
+using StackExchange.Redis;
+using System.Text;
+using System.Threading.RateLimiting;
+using Worldiator.Server.Application;
+using Worldiator.Server.Application.LiveCrash;
+using Worldiator.Server.Application.MarginCall;
+using Worldiator.Server.Background;
+using Worldiator.Server.Contracts;
+using Worldiator.Server.Domain;
+using Worldiator.Server.Domain.MarginCall;
+using Worldiator.Server.Infrastructure;
+using Worldiator.Server.Infrastructure.Distributed;
+using Worldiator.Server.Infrastructure.Persistence;
+using Worldiator.Server.Infrastructure.RGS;
+using Worldiator.Server.Presentation.Controllers;
+using Worldiator.Server.Presentation.Hubs;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+
+// ─── JWT Authentication ───────────────────────────────────────────────────────
+// WSB platform launches the game with ?token=<jwt> in the URL.
+// The client passes it to SignalR via accessTokenFactory → query string.
+// Production key/issuer must be set in appsettings.Production.json or env vars.
+var jwtKey = builder.Configuration["Jwt:Key"];
+if (string.IsNullOrWhiteSpace(jwtKey))
+    throw new InvalidOperationException("Jwt:Key must be set via environment variable or secrets manager. Never hardcode it.");
+
+var jwtIssuer   = builder.Configuration["Jwt:Issuer"]   ?? "worldiator-dev";
+var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "worldiator-game";
+
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(opt =>
+    {
+        opt.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey        = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
+            ValidateIssuer          = true,
+            ValidIssuer             = jwtIssuer,
+            ValidateAudience        = true,
+            ValidAudience           = jwtAudience,
+            ValidateLifetime        = true,
+            ClockSkew               = TimeSpan.FromSeconds(30),
+        };
+        // SignalR transports token via query string — HTTP headers aren't available on WebSocket upgrade.
+        opt.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = ctx =>
+            {
+                var token = ctx.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(token) &&
+                    (ctx.Request.Path.StartsWithSegments("/gamehub") || ctx.Request.Path.StartsWithSegments("/margincallhub")
+                     || ctx.Request.Path.StartsWithSegments("/livecrashhub")))
+                    ctx.Token = token;
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+// ─── Redis ────────────────────────────────────────────────────────────────────
+var redisConnStr = builder.Configuration["Redis:ConnectionString"];
+var redisEnabled = !string.IsNullOrEmpty(redisConnStr);
+
+if (redisEnabled)
+{
+    var redis = await ConnectionMultiplexer.ConnectAsync(redisConnStr!);
+    builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
+    builder.Services.AddSingleton<ILeaderElection, RedisLeaderElection>();
+    builder.Services.AddSignalR().AddStackExchangeRedis(redisConnStr!);
+}
+else
+{
+    builder.Services.AddSignalR();
+}
+
+// ─── SQL Server persistence ───────────────────────────────────────────────────
+var sqlConnStr = builder.Configuration.GetConnectionString("DefaultConnection");
+if (!string.IsNullOrEmpty(sqlConnStr))
+{
+    builder.Services.AddScoped<IAsyncRoundRepository, SqlRoundRepository>();
+}
+
+// ─── RNG Integration Point ────────────────────────────────────────────────────
+builder.Services.AddSingleton<IRNGService, EasyRNGService>();
+
+// ─── RGS Integration Point ────────────────────────────────────────────────────
+// Select the wallet adapter via RGS:Provider in appsettings.json or environment:
+//   RGS__Provider=Operator1   → Operator1RGSAdapter  (config: RGS:Operator1:*)
+//   RGS__Provider=Operator2   → Operator2RGSAdapter  (config: RGS:Operator2:*)
+//   RGS__Provider=Operator3   → Operator3RGSAdapter  (config: RGS:Operator3:*)
+//   RGS__Provider=Stub        → StubRGSAdapter        (Development or Staging only — never Production)
+var rgsProvider = builder.Configuration["RGS:Provider"] ?? "Stub";
+
+switch (rgsProvider)
+{
+    case "Wsb":
+        builder.Services.AddHttpClient<IRGSAdapter, WsbRGSAdapter>();
+        break;
+    case "Operator1":
+        builder.Services.AddHttpClient<IRGSAdapter, Operator1RGSAdapter>();
+        break;
+    case "Operator2":
+        builder.Services.AddHttpClient<IRGSAdapter, Operator2RGSAdapter>();
+        break;
+    case "Operator3":
+        builder.Services.AddHttpClient<IRGSAdapter, Operator3RGSAdapter>();
+        break;
+    // Staging is allowed here (unlike the upstream Worldiator service) so this
+    // standalone Feeding Frenzy deployment can run with a fake in-memory wallet
+    // and a demo balance for testing — see RGS:Stub:DefaultBalance. Switch
+    // RGS:Provider back to a real operator before wiring up real money.
+    case "Stub" when builder.Environment.IsDevelopment() || builder.Environment.IsStaging():
+        builder.Services.AddSingleton<IRGSAdapter, StubRGSAdapter>();
+        break;
+    case "Stub":
+        throw new InvalidOperationException("StubRGSAdapter cannot be used in Production. Set RGS:Provider to Wsb, Operator1, Operator2, or Operator3.");
+    default:
+        throw new InvalidOperationException($"Unknown RGS provider \"{rgsProvider}\". Valid values: Wsb, Operator1, Operator2, Operator3 (Stub in Development/Staging only).");
+}
+
+// ─── Core Application Services ───────────────────────────────────────────────
+builder.Services.AddSingleton<IRoundRepository, InMemoryRoundRepository>();
+builder.Services.AddSingleton<IChatService, ChatService>();
+builder.Services.AddSingleton<GameEngine>();
+builder.Services.AddHostedService<GameHostedService>();
+
+// ─── Multi-game platform ─────────────────────────────────────────────────────
+// Other crash / slot / prediction games launch through api/games/launch and settle
+// through api/wallet/* (see WalletController). Games are listed under "Games".
+builder.Services.AddSingleton<IGameRegistry, ConfigGameRegistry>();
+builder.Services.AddSingleton<SessionTokenService>();
+if (!string.IsNullOrEmpty(sqlConnStr))
+    builder.Services.AddSingleton<IWalletLedger, SqlWalletLedger>();
+else
+    builder.Services.AddSingleton<IWalletLedger, InMemoryWalletLedger>();
+builder.Services.AddScoped<WalletService>();
+// Games with an "Rng" block play through api/play using this API's RNG (see RngSettings).
+builder.Services.AddSingleton<IGameRngService, EasyGameRngService>();
+builder.Services.AddScoped<PlayService>();
+
+// ─── Margin Call (TradeX) — live trading crash game ─────────────────────────
+// Server-authoritative markets, rounds and settlement on /margincallhub. See MarginCallEngine.
+builder.Services.Configure<MarginCallOptions>(builder.Configuration.GetSection("MarginCall"));
+builder.Services.AddSingleton<MarginCallEngine>();
+builder.Services.AddHostedService<MarginCallHostedService>();
+
+// ─── Live crash games ───────────────────────────────────────────────────────
+// One engine per "Games" entry with Engine = LiveCrash, each with its own RNG instance,
+// rounds and SignalR group, all served by /livecrashhub. See LiveCrashEngine.
+builder.Services.AddSingleton<LiveCrashRegistry>();
+builder.Services.AddHostedService<LiveCrashHostedService>();
+
+// ─── Rate Limiting ────────────────────────────────────────────────────────────
+builder.Services.AddRateLimiter(opt =>
+{
+    opt.AddSlidingWindowLimiter("bet", o =>
+    {
+        o.PermitLimit = 5;
+        o.Window = TimeSpan.FromSeconds(10);
+        o.SegmentsPerWindow = 2;
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+    opt.AddFixedWindowLimiter("chat", o =>
+    {
+        o.PermitLimit = 30;
+        o.Window = TimeSpan.FromMinutes(1);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+    // Game backends authenticated by X-Game-Key get their own high-volume bucket (they call
+    // debit/credit for every player); signed-in players get one each (a slot on autoplay plays
+    // every second, and many players can share one carrier IP); everyone else is limited per IP.
+    // Runs after UseAuthentication, so ctx.User is already validated.
+    opt.AddPolicy("api", ctx =>
+    {
+        var gameKey = ctx.Request.Headers[WalletController.GameKeyHeader].ToString();
+        var game = ctx.RequestServices.GetRequiredService<IGameRegistry>().FindByServerKey(gameKey);
+        if (game != null)
+            return RateLimitPartition.GetFixedWindowLimiter("game:" + game.GameId, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 6000,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            });
+        var player = ctx.User.Identity?.IsAuthenticated == true ? SessionTokenService.FromPrincipal(ctx.User) : null;
+        if (player != null)
+            return RateLimitPartition.GetFixedWindowLimiter("player:" + player.PlayerId, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 300,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            });
+        return RateLimitPartition.GetFixedWindowLimiter("ip:" + ctx.Connection.RemoteIpAddress, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+        });
+    });
+    opt.RejectionStatusCode = 429;
+});
+
+// ─── Health Checks ───────────────────────────────────────────────────────────
+var health = builder.Services.AddHealthChecks();
+if (!string.IsNullOrEmpty(sqlConnStr))
+    health.AddSqlServer(sqlConnStr, name: "sql");
+if (redisEnabled)
+    health.AddRedis(redisConnStr!, name: "redis");
+
+// ─── CORS ────────────────────────────────────────────────────────────────────
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        if (builder.Environment.IsDevelopment())
+        {
+            // Allow any localhost port in dev — Vite auto-increments (5173–5176+)
+            policy.SetIsOriginAllowed(o => new Uri(o).Host == "localhost")
+                  .AllowAnyHeader().AllowAnyMethod().AllowCredentials();
+        }
+        else
+        {
+            // Support AllowedOrigins (array) or legacy AllowedOrigin (single string)
+            var allowedOrigins = builder.Configuration
+                .GetSection("AllowedOrigins").Get<string[]>();
+
+            if (allowedOrigins == null || allowedOrigins.Length == 0)
+            {
+                var single = builder.Configuration["AllowedOrigin"];
+                allowedOrigins = !string.IsNullOrEmpty(single)
+                    ? [single]
+                    : null;
+            }
+
+            // Each game's frontend reads the player balance from api/wallet/balance, so its origin is allowed too.
+            var gameOrigins = (builder.Configuration.GetSection("Games").Get<List<GameDefinition>>() ?? [])
+                .Where(g => Uri.TryCreate(g.LaunchUrl, UriKind.Absolute, out _))
+                .Select(g => new Uri(g.LaunchUrl).GetLeftPart(UriPartial.Authority));
+            if (allowedOrigins != null && allowedOrigins.Length > 0)
+                allowedOrigins = allowedOrigins.Concat(gameOrigins).Distinct().ToArray();
+
+            if (allowedOrigins != null && allowedOrigins.Length > 0)
+                policy.WithOrigins(allowedOrigins)
+                      .AllowAnyHeader().AllowAnyMethod().AllowCredentials();
+            else
+                policy.SetIsOriginAllowed(_ => true)
+                      .AllowAnyHeader().AllowAnyMethod().AllowCredentials();
+        }
+    });
+});
+
+var app = builder.Build();
+
+app.Use(async (ctx, next) =>
+{
+    ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    ctx.Response.Headers["X-Frame-Options"] = "DENY";
+    ctx.Response.Headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+    ctx.Response.Headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()";
+    await next();
+});
+
+app.UseCors();
+app.UseAuthentication();
+app.UseRateLimiter();
+app.UseAuthorization();
+app.MapControllers().RequireRateLimiting("api");
+app.MapHub<GameHub>("/gamehub");
+app.MapHub<MarginCallHub>("/margincallhub");
+app.MapHub<LiveCrashHub>("/livecrashhub");
+app.MapHealthChecks("/health");
+
+// Session creation (called by Games-API on game launch) lives in AuthController
+// (api/auth/create-session) and GamesController (api/games/launch).
+
+// ─── Dev token endpoint ───────────────────────────────────────────────────────
+// Issues a short-lived JWT for dev/staging — not available in production.
+// In production, WSB platform provides the token via the game launch URL: ?token=<jwt>
+// Pass ?gameId=<id> to get a token for another game in the "Games" list.
+if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
+{
+    app.MapGet("/api/dev-token", (SessionTokenService tokens, string? gameId) =>
+    {
+        var playerId = Random.Shared.NextInt64(100_000_000, 999_999_999).ToString();
+        var username = "dev_" + playerId[^4..];
+        var token    = tokens.Issue(playerId, username, "ZAR", gameId ?? SessionTokenService.DefaultGameId);
+        return Results.Ok(new { token });
+    }).AllowAnonymous();
+}
+
+app.Run();

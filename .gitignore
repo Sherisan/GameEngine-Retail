@@ -1,0 +1,10 @@
+﻿bin/
+obj/
+publish/
+appsettings.Development.json
+appsettings.Production.json
+*.user
+.vs/
+.idea/
+
+publish-selfcontained/
