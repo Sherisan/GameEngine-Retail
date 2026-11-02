@@ -1,6 +1,6 @@
 namespace Worldiator.Server.Domain;
 
-public enum GameType { Crash, Slot, Prediction, Scratch }
+public enum GameType { Crash, Slot, Prediction, Scratch, Table }
 
 /// <summary>
 /// Which engine runs the game. Every engine draws from the game's own RNG instance (IGameRngService keeps
@@ -8,9 +8,10 @@ public enum GameType { Crash, Slot, Prediction, Scratch }
 ///   Instant    — one request per play through api/play (Rng: Multiplier / Pick / Target).
 ///   LiveCrash  — shared rounds on /livecrashhub: bet, watch the multiplier climb, cash out before the crash (Rng: Target).
 ///   MarginCall — the trading crash game on /margincallhub (Rng: Target, optional — sets round length only).
+///   Roulette   — on-demand European roulette through api/roulette: many bets per spin, one draw (Rng: Wheel).
 ///   Custom     — has its own engine and RNG (Feeding Frenzy) or its own backend.
 /// </summary>
-public enum EngineKind { Instant, LiveCrash, MarginCall, Custom }
+public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom }
 
 /// <summary>
 /// A game that can be launched through this API and use its shared wallet endpoints.
@@ -58,6 +59,9 @@ public class GameDefinition
     /// <summary>Round timing for Engine = LiveCrash. Defaults apply when omitted.</summary>
     public LiveCrashSettings? Live { get; set; }
 
+    /// <summary>Table limits for Engine = Roulette. Defaults apply when omitted.</summary>
+    public RouletteSettings? Roulette { get; set; }
+
     public void Validate()
     {
         void Fail(string msg) => throw new InvalidOperationException($"Games[{GameId}]: {msg}");
@@ -77,6 +81,46 @@ public class GameDefinition
                 if (Rng != null && Rng.Model != RngModel.Target)
                     Fail("Engine MarginCall takes an Rng block with Model Target, or none.");
                 break;
+            case EngineKind.Roulette:
+                if (Rng?.Model != RngModel.Wheel)
+                    Fail("Engine Roulette needs an Rng block with Model Wheel (it draws the winning pocket).");
+                (Roulette ??= new RouletteSettings()).Validate(GameId, MaxBet);
+                break;
+        }
+        if (Rng?.Model == RngModel.Wheel && Engine != EngineKind.Roulette)
+            Fail("Rng Model Wheel is only used by Engine Roulette.");
+    }
+}
+
+/// <summary>
+/// Roulette table limits. The total stake per spin is bounded by the game's MinBet / MaxBet;
+/// Limits caps the amount on one position, by bet type (see Domain/Roulette/RouletteTable).
+/// </summary>
+public class RouletteSettings
+{
+    /// <summary>Most separate positions in one spin (call bets alone use up to 9).</summary>
+    public int MaxBetsPerSpin { get; set; } = 150;
+
+    /// <summary>Max per position by bet type (straight, split, street, trio, corner, four, line, column, dozen, evenMoney). Missing = the game's MaxBet.</summary>
+    public Dictionary<string, decimal> Limits { get; set; } = [];
+
+    public decimal LimitFor(string betType, decimal maxBet)
+    {
+        foreach (var (type, limit) in Limits)
+            if (string.Equals(type, betType, StringComparison.OrdinalIgnoreCase)) return limit;
+        return maxBet;
+    }
+
+    public void Validate(string gameId, decimal maxBet)
+    {
+        void Fail(string msg) => throw new InvalidOperationException($"Games[{gameId}].Roulette: {msg}");
+        if (MaxBetsPerSpin is < 1 or > 500) Fail("MaxBetsPerSpin must be 1-500.");
+        foreach (var (type, limit) in Limits)
+        {
+            if (!Roulette.RouletteTable.IsBetType(type))
+                Fail($"unknown bet type \"{type}\" in Limits. Known: {string.Join(", ", Roulette.RouletteTable.Payouts.Keys)}.");
+            if (limit <= 0 || limit != Math.Round(limit, 2)) Fail($"Limits.{type} must be a positive amount with at most 2 decimals.");
+            if (limit > maxBet) Fail($"Limits.{type} ({limit}) is above the game's MaxBet ({maxBet}).");
         }
     }
 }
@@ -114,8 +158,9 @@ public class LiveCrashSettings
 ///   Multiplier — draw a payout multiplier from a weighted table; the frontend renders a matching screen (slots, wheels, scratch).
 ///   Pick       — the player picks an option, the RNG draws one; a match pays that option's Payout (predictions).
 ///   Target     — the player picks a target multiplier, the RNG draws a crash point; crash ≥ target pays target (instant crash / limbo).
+///   Wheel      — the RNG draws one of Pockets equally likely pockets (draw = pocket number); used by Engine Roulette.
 /// </summary>
-public enum RngModel { Multiplier, Pick, Target }
+public enum RngModel { Multiplier, Pick, Target, Wheel }
 
 public class RngSettings
 {
@@ -130,6 +175,9 @@ public class RngSettings
     /// <summary>Target model: house edge and the highest crash point.</summary>
     public double HouseEdgePercent { get; set; } = 4.0;
     public decimal MaxMultiplier { get; set; } = 10000m;
+
+    /// <summary>Wheel model: number of pockets. 37 = European single-zero roulette (0-36).</summary>
+    public int Pockets { get; set; } = 37;
 
     /// <summary>Rotate (and reveal) the server seed after this many draws so past results can be verified.</summary>
     public int RotateSeedEvery { get; set; } = 1000;
@@ -148,7 +196,9 @@ public class RngSettings
     {
         RngModel.Multiplier => Outcomes.Sum(o => (decimal)o.Weight * o.Multiplier) / Math.Max(1, Outcomes.Sum(o => (decimal)o.Weight)),
         RngModel.Pick       => Options.Count == 0 ? 0 : Options.Max(o => o.Weight * o.Payout) / Math.Max(1, Options.Sum(o => (decimal)o.Weight)),
-        _                   => 1m - (decimal)HouseEdgePercent / 100m,
+        // Every roulette bet pays (36 / numbers covered) - 1 to 1, so each returns 36 / Pockets.
+        RngModel.Wheel      => 36m / Math.Max(1, Pockets),
+        _                  => 1m - (decimal)HouseEdgePercent / 100m,
     };
 
     public void Validate(string gameId)
@@ -170,6 +220,9 @@ public class RngSettings
             case RngModel.Target:
                 if (HouseEdgePercent is < 0 or >= 100) Fail("HouseEdgePercent must be 0-100.");
                 if (MaxMultiplier < 1.01m) Fail("MaxMultiplier must be >= 1.01.");
+                break;
+            case RngModel.Wheel:
+                if (Pockets != 37) Fail("Wheel model supports the European single-zero wheel only (Pockets 37).");
                 break;
         }
         if (RotateSeedEvery < 1) Fail("RotateSeedEvery must be >= 1.");

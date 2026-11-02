@@ -102,16 +102,16 @@ var rgsProvider = builder.Configuration["RGS:Provider"] ?? "Stub";
 switch (rgsProvider)
 {
     case "Wsb":
-        builder.Services.AddHttpClient<IRGSAdapter, WsbRGSAdapter>();
+        AddOperatorWallet<WsbRGSAdapter>();
         break;
     case "Operator1":
-        builder.Services.AddHttpClient<IRGSAdapter, Operator1RGSAdapter>();
+        AddOperatorWallet<Operator1RGSAdapter>();
         break;
     case "Operator2":
-        builder.Services.AddHttpClient<IRGSAdapter, Operator2RGSAdapter>();
+        AddOperatorWallet<Operator2RGSAdapter>();
         break;
     case "Operator3":
-        builder.Services.AddHttpClient<IRGSAdapter, Operator3RGSAdapter>();
+        AddOperatorWallet<Operator3RGSAdapter>();
         break;
     // Staging is allowed here (unlike the upstream Worldiator service) so this
     // standalone Feeding Frenzy deployment can run with a fake in-memory wallet
@@ -124,6 +124,24 @@ switch (rgsProvider)
         throw new InvalidOperationException("StubRGSAdapter cannot be used in Production. Set RGS:Provider to Wsb, Operator1, Operator2, or Operator3.");
     default:
         throw new InvalidOperationException($"Unknown RGS provider \"{rgsProvider}\". Valid values: Wsb, Operator1, Operator2, Operator3 (Stub in Development/Staging only).");
+}
+
+// Real operator wallet. In Development/Staging, demo players from /api/dev-token
+// (ids prefixed "demo_") are routed to an in-memory wallet instead, so the game
+// opened without a platform launch still gets a demo balance it can bet with.
+void AddOperatorWallet<TAdapter>() where TAdapter : class, IRGSAdapter
+{
+    builder.Services.AddHttpClient<TAdapter>();
+    if (builder.Environment.IsDevelopment() || builder.Environment.IsStaging())
+    {
+        builder.Services.AddSingleton<StubRGSAdapter>();
+        builder.Services.AddTransient<IRGSAdapter>(sp => new DemoWalletRGSAdapter(
+            sp.GetRequiredService<TAdapter>(), sp.GetRequiredService<StubRGSAdapter>()));
+    }
+    else
+    {
+        builder.Services.AddTransient<IRGSAdapter>(sp => sp.GetRequiredService<TAdapter>());
+    }
 }
 
 // ─── Core Application Services ───────────────────────────────────────────────
@@ -145,6 +163,8 @@ builder.Services.AddScoped<WalletService>();
 // Games with an "Rng" block play through api/play using this API's RNG (see RngSettings).
 builder.Services.AddSingleton<IGameRngService, EasyGameRngService>();
 builder.Services.AddScoped<PlayService>();
+// Engine = Roulette games spin through api/roulette (many bets, one draw per spin).
+builder.Services.AddScoped<RouletteService>();
 
 // ─── Margin Call (TradeX) — live trading crash game ─────────────────────────
 // Server-authoritative markets, rounds and settlement on /margincallhub. See MarginCallEngine.
@@ -290,7 +310,7 @@ if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
 {
     app.MapGet("/api/dev-token", (SessionTokenService tokens, string? gameId) =>
     {
-        var playerId = Random.Shared.NextInt64(100_000_000, 999_999_999).ToString();
+        var playerId = DemoWalletRGSAdapter.DemoPlayerPrefix + Random.Shared.NextInt64(100_000_000, 999_999_999);
         var username = "dev_" + playerId[^4..];
         var token    = tokens.Issue(playerId, username, "ZAR", gameId ?? SessionTokenService.DefaultGameId);
         return Results.Ok(new { token });

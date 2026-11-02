@@ -10,6 +10,7 @@ namespace Worldiator.Server.Infrastructure;
 /// per game playing many draws per server-seed batch, rotated (and the old seed revealed) every
 /// RotateSeedEvery draws.
 ///   Multiplier / Pick → ProvablyFairSlotMultiplierGenerator over the outcomes / options (draw = table index)
+///   Wheel             → the same, over Pockets equal weights (draw = pocket number)
 ///   Target            → ProvablyFairCrashMultiplierGenerator (draw = crash point)
 /// Generators aren't documented as thread-safe, so each is used under its own lock.
 /// </summary>
@@ -81,9 +82,13 @@ public class EasyGameRngService(ILogger<EasyGameRngService> logger) : IGameRngSe
                     // EasyRNG requires positive, unique multipliers, so entry i is encoded as multiplier i + 1
                     // with the configured weight (a 0x loss can't go in directly). Verifying a draw uses this
                     // same encoded table.
-                    var weights = rng.Model == RngModel.Pick
-                        ? rng.Options.Select(o => o.Weight)
-                        : rng.Outcomes.Select(o => o.Weight);
+                    // Wheel: every pocket weight 1, so draw = pocket number with equal odds.
+                    var weights = rng.Model switch
+                    {
+                        RngModel.Pick  => rng.Options.Select(o => o.Weight),
+                        RngModel.Wheel => Enumerable.Repeat(1UL, rng.Pockets),
+                        _              => rng.Outcomes.Select(o => o.Weight),
+                    };
                     var table = weights.Select((w, i) => new MultiplierTableEntry(i + 1, w)).ToList();
                     var g = new ProvablyFairSlotMultiplierGenerator(table);
                     return new GameGenerator
