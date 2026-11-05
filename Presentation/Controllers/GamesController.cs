@@ -10,9 +10,21 @@ namespace Worldiator.Server.Presentation.Controllers;
 [ApiController]
 [Route("api/games")]
 [AllowAnonymous]
-public class GamesController(IGameRegistry games, SessionTokenService tokens, IConfiguration config, ILogger<GamesController> logger)
+public class GamesController(IGameRegistry games, SessionTokenService tokens, IGameConfigStore gameConfig, IConfiguration config, ILogger<GamesController> logger)
     : ControllerBase
 {
+    /// <summary>
+    /// The multipliers at which the player's fish / ship evolves (set in the Game Back Office).
+    /// Public — the game frontends load it at startup.
+    /// </summary>
+    [HttpGet("{gameId}/evolution")]
+    public IActionResult Evolution(string gameId)
+    {
+        var tiers = gameConfig.GetEvolutionTiers(gameId);
+        if (tiers.Count == 0) return NotFound(new { error = $"Game \"{gameId}\" has no evolution ladder." });
+        return Ok(tiers.Select(t => new { t.Level, t.Code, t.Name, t.Multiplier }));
+    }
+
     /// <summary>Public list of enabled games — safe for a lobby.</summary>
     [HttpGet]
     public IActionResult List() =>

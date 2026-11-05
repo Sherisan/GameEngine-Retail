@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Options;
+using Worldiator.Server.Application.Promotions;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Domain;
 using Worldiator.Server.Domain.MarginCall;
+using Worldiator.Server.Domain.Promotions;
 using Worldiator.Server.Presentation.Hubs;
 
 namespace Worldiator.Server.Application.MarginCall;
@@ -24,6 +26,7 @@ public sealed class MarginCallEngine(
     IGameRngService rng,
     IServiceScopeFactory scopes,
     IHubContext<MarginCallHub> hub,
+    PromoEngine promos,
     ILogger<MarginCallEngine> logger)
 {
     // Round ids are seconds since this epoch (rounds are > 1s apart) so they never repeat across restarts —
@@ -37,17 +40,26 @@ public sealed class MarginCallEngine(
     private MarginRound _round = new() { Status = MarginRoundStatus.RESULTS };
     private readonly List<MarginPosition> _positions = [];
     private long _crashAt, _closeAt;
+    private double _growthRate; // fixed per round, so a back-office edit never bends a curve that is already flying
     private bool _frozen;
 
     public string GameId => _opt.GameId;
-    public MarginCallOptions Options => _opt;
     public GameDefinition? Game => games.Find(_opt.GameId);
+
+    /// <summary>
+    /// The game's Trading block as the back office last saved it (enabled or not), else the appsettings "MarginCall"
+    /// section. Read on every use, so edits apply from the next trade / phase — except TickMs and Markets, which
+    /// are read once in RunAsync.
+    /// </summary>
+    public TradingSettings Trading =>
+        games.All.FirstOrDefault(g => string.Equals(g.GameId, _opt.GameId, StringComparison.OrdinalIgnoreCase))?.Trading ?? _opt;
 
     public static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
     public async Task RunAsync(CancellationToken ct)
     {
-        if (_opt.Markets.Count == 0)
+        var trading = Trading;
+        if (trading.Markets.Count == 0)
         {
             logger.LogWarning("MarginCall: no Markets configured — engine not started.");
             return;
@@ -56,13 +68,13 @@ public sealed class MarginCallEngine(
         var now = Now();
         lock (_lock)
         {
-            _markets  = _opt.Markets.Select(m => new MarginMarket(m, now, _opt.TickMs)).ToList();
+            _markets  = trading.Markets.Select(m => new MarginMarket(m, now, trading.TickMs)).ToList();
             _bySymbol = _markets.ToDictionary(m => m.Config.Symbol, StringComparer.OrdinalIgnoreCase);
             StartWaiting(now);
         }
         logger.LogInformation("MarginCall engine started: {Markets} markets, game={GameId}", _markets.Count, _opt.GameId);
 
-        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_opt.TickMs));
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(trading.TickMs));
         while (await timer.WaitForNextTickAsync(ct))
         {
             try { await StepAsync(); }
@@ -100,13 +112,14 @@ public sealed class MarginCallEngine(
 
     private (object? RoundChanged, (MarginRound, List<MarginPosition>)? ToSettle) AdvancePhase(long now)
     {
+        var t = Trading;
         switch (_round.Status)
         {
             case MarginRoundStatus.WAITING when now >= _round.PhaseEndsAt:
                 var delay = CrashDelayMs(_round.CrashMultiplier);
                 _round.StartedAt   = now;
                 _crashAt           = now + delay;
-                _closeAt           = _crashAt - _opt.ClosedMs;
+                _closeAt           = _crashAt - t.ClosedMs;
                 _round.Status      = MarginRoundStatus.TRADING;
                 _round.PhaseEndsAt = _closeAt;
                 return (PublicRound(), null);
@@ -115,7 +128,7 @@ public sealed class MarginCallEngine(
                 _frozen              = true;
                 _round.Status        = MarginRoundStatus.CRASHED;
                 _round.CrashedAt     = now;
-                _round.PhaseEndsAt   = now + _opt.CrashedMs;
+                _round.PhaseEndsAt   = now + t.CrashedMs;
                 _round.CrashPrices   = _markets.ToDictionary(m => m.Config.Symbol, m => m.Price);
                 return (PublicRound(), null);
 
@@ -126,7 +139,7 @@ public sealed class MarginCallEngine(
 
             case MarginRoundStatus.CRASHED when now >= _round.PhaseEndsAt:
                 _round.Status      = MarginRoundStatus.SETTLING;
-                _round.PhaseEndsAt = now + _opt.SettlingMs;
+                _round.PhaseEndsAt = now + t.SettlingMs;
                 var settle = _positions.ToList();
                 _positions.Clear();
                 return (PublicRound(), (_round, settle));
@@ -134,7 +147,7 @@ public sealed class MarginCallEngine(
             case MarginRoundStatus.SETTLING when now >= _round.PhaseEndsAt:
                 _frozen            = false; // markets resume beneath the results screen
                 _round.Status      = MarginRoundStatus.RESULTS;
-                _round.PhaseEndsAt = now + _opt.ResultsMs;
+                _round.PhaseEndsAt = now + t.ResultsMs;
                 return (PublicRound(), null);
 
             case MarginRoundStatus.RESULTS when now >= _round.PhaseEndsAt:
@@ -146,13 +159,15 @@ public sealed class MarginCallEngine(
 
     private void StartWaiting(long now)
     {
+        var t = Trading;
         var id = Math.Max(_round.Id + 1, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - RoundEpoch);
+        _growthRate = t.GrowthRate;
         _round = new MarginRound
         {
             Id              = id,
             Status          = MarginRoundStatus.WAITING,
             CrashMultiplier = DrawCrashMultiplier(),
-            PhaseEndsAt     = now + _opt.WaitingMs,
+            PhaseEndsAt     = now + t.WaitingMs,
         };
         _crashAt = _closeAt = 0;
     }
@@ -165,12 +180,13 @@ public sealed class MarginCallEngine(
         _                         => Math.Min(_round.CrashMultiplier, MultiplierAt((_round.CrashedAt ?? now) - _round.StartedAt)),
     };
 
-    private double MultiplierAt(long elapsedMs) => Math.Exp(_opt.GrowthRate * (elapsedMs / 1000.0));
+    private double MultiplierAt(long elapsedMs) => Math.Exp(_growthRate * (elapsedMs / 1000.0));
 
     private long CrashDelayMs(double crashMultiplier)
     {
-        var raw = Math.Log(crashMultiplier) / _opt.GrowthRate * 1000;
-        return (long)Math.Min(_opt.MaxTradingMs, Math.Max(_opt.MinOpenMs + _opt.ClosedMs, raw));
+        var t = Trading;
+        var raw = Math.Log(crashMultiplier) / _growthRate * 1000;
+        return (long)Math.Min(t.MaxTradingMs, Math.Max(t.MinOpenMs + t.ClosedMs, raw));
     }
 
     /// <summary>
@@ -227,30 +243,48 @@ public sealed class MarginCallEngine(
     }
 
     public async Task<(object? Position, decimal? Balance, string? Error)> OpenPositionAsync(
-        PlayerSession player, string market, string direction, decimal stake, int multiplier)
+        PlayerSession player, string market, string direction, decimal stake, int multiplier, bool freeBet = false)
     {
         var game = Game;
         if (game == null) return (null, null, "Game is not enabled.");
         direction = (direction ?? string.Empty).ToUpperInvariant();
         if (direction is not ("BUY" or "SELL")) return (null, null, "Direction must be BUY or SELL.");
-        if (!_opt.AllowedMultipliers.Contains(multiplier)) return (null, null, $"Multiplier must be one of {string.Join(", ", _opt.AllowedMultipliers)}.");
+        // One read of the settings for the whole trade: the multiplier, position cap, commission and spread it is checked
+        // and priced with stay with it to settlement, whatever the back office changes meanwhile.
+        var trading = Trading;
+        if (!trading.AllowedMultipliers.Contains(multiplier)) return (null, null, $"Multiplier must be one of {string.Join(", ", trading.AllowedMultipliers)}.");
 
+        string? closed;
         long roundId;
         lock (_lock)
         {
-            if (!_bySymbol.ContainsKey(market ?? string.Empty)) return (null, null, "Unknown market.");
-            if (_round.Status != MarginRoundStatus.TRADING) return (null, null, "Trading is currently closed.");
-            if (_positions.Count(p => p.PlayerId == player.PlayerId) >= _opt.MaxPositionsPerRound)
-                return (null, null, $"At most {_opt.MaxPositionsPerRound} positions per round.");
             roundId = _round.Id;
+            closed = !_bySymbol.ContainsKey(market ?? string.Empty) ? "Unknown market."
+                : _round.Status != MarginRoundStatus.TRADING ? "Trading is currently closed."
+                : _positions.Count(p => p.PlayerId == player.PlayerId) >= trading.MaxPositionsPerRound
+                    ? $"At most {trading.MaxPositionsPerRound} positions per round." : null;
+        }
+        if (closed != null) return (null, null, closed);
+
+        // A free bet's stake is the promo's: claim one; its value is the stake, and no debit is made.
+        PromoAward? free = null;
+        if (freeBet)
+        {
+            free = await promos.ClaimFreeBetAsync(player, game.GameId);
+            if (free == null) return (null, null, "You have no free bet for this game.");
+            stake = free.Amount;
         }
 
         var positionId = Guid.NewGuid().ToString("N");
         using var scope = scopes.CreateScope();
         var wallet = scope.ServiceProvider.GetRequiredService<WalletService>();
 
-        var debit = await wallet.DebitAsync(game, player, roundId.ToString(), $"{positionId}-bet", stake);
-        if (!debit.Ok) return (null, null, debit.Error);
+        WalletResult? debit = null;
+        if (free == null)
+        {
+            debit = await wallet.DebitAsync(game, player, roundId.ToString(), $"{positionId}-bet", stake);
+            if (!debit.Ok) return (null, null, debit.Error);
+        }
 
         // The entry price is taken after the stake is secured, at the server's current price.
         MarginPosition? position = null;
@@ -259,6 +293,7 @@ public sealed class MarginCallEngine(
             if (_round.Id == roundId && _round.Status == MarginRoundStatus.TRADING)
             {
                 var mid = _bySymbol[market!].Price;
+                var halfSpread = trading.SpreadBps / 20000.0;
                 position = new MarginPosition
                 {
                     Id         = positionId,
@@ -270,13 +305,21 @@ public sealed class MarginCallEngine(
                     Direction  = direction,
                     Stake      = stake,
                     Multiplier = multiplier,
-                    EntryPrice = direction == "BUY" ? Ask(mid) : Bid(mid),
+                    EntryPrice = direction == "BUY" ? mid * (1 + halfSpread) : mid * (1 - halfSpread),
+                    HalfSpread = halfSpread,
+                    CommissionPercent = trading.CommissionPercent,
                     OpenedAt   = Now(),
+                    FreeBet    = free,
                 };
                 _positions.Add(position);
             }
         }
 
+        if (position == null && free != null)
+        {
+            await promos.ReleaseFreeBetAsync(free);
+            return (null, null, "Trading closed before your free bet was placed — you still have it.");
+        }
         if (position == null)
         {
             // Trading closed while the wallet call was in flight — give the stake back.
@@ -289,7 +332,8 @@ public sealed class MarginCallEngine(
 
         logger.LogInformation("MarginCall open: round={RoundId} player={PlayerId} {Direction} {Market} stake={Stake} x{Multiplier} entry={Entry}",
             roundId, player.PlayerId, direction, position.Market, stake, multiplier, position.EntryPrice);
-        return (PositionDto(position), debit.Balance, null);
+        promos.BetPlaced(game.GameId, player.PlayerId, player.Username, player.Currency, stake, freeBet: free != null);
+        return (PositionDto(position), debit?.Balance, null);
     }
 
     // ── Settlement ──────────────────────────────────────────────────────────
@@ -299,6 +343,11 @@ public sealed class MarginCallEngine(
         var game = Game;
         if (game == null || positions.Count == 0) return;
         var closedAt = round.CrashedAt ?? Now();
+
+        // The crash point players saw (the drawn one, unless the round hit its maximum length first).
+        var shown = Math.Min(round.CrashMultiplier, Math.Exp(_growthRate * ((closedAt - round.StartedAt) / 1000.0)));
+        promos.RoundEnded(game.GameId, round.Id.ToString(), Math.Round((decimal)shown, 2, MidpointRounding.ToZero),
+            positions.Select(p => new PromoBet(p.PlayerId, p.Username, p.Currency, p.Stake, p.FreeBet != null)).ToList());
 
         foreach (var byPlayer in positions.GroupBy(p => p.PlayerId))
         {
@@ -315,12 +364,25 @@ public sealed class MarginCallEngine(
                 foreach (var p in byPlayer)
                 {
                     var (exit, commission, ret) = Settle(p, round.CrashPrices![p.Market]);
-                    ret = Math.Min(ret, game.MaxWin - credited); // per-round cap, as the ledger enforces
                     var pending = false;
+                    if (p.FreeBet != null)
+                    {
+                        // Promo money: the promotion pays what it allows (normally the return above the stake), retrying itself.
+                        ret = await promos.SettleFreeBetAsync(p.FreeBet, round.Id.ToString(), ret);
+                        settled.Add(new MarginSettledPosition(p.Id, p.RoundId, p.Market, p.Direction, p.Stake, p.Multiplier,
+                            p.EntryPrice, exit, commission, ret, ret, ret > 0 ? "WIN" : "LOSS", p.OpenedAt, closedAt, false));
+                        continue;
+                    }
+                    ret = Math.Min(ret, game.MaxWin - credited); // per-round cap, as the ledger enforces
                     if (ret > 0)
                     {
                         var credit = await wallet.CreditAsync(game, player, round.Id.ToString(), $"{p.Id}-win", ret);
-                        if (credit.Ok) { credited += ret; balance = credit.Balance ?? balance; }
+                        if (credit.Ok)
+                        {
+                            credited += ret;
+                            balance = credit.Balance ?? balance;
+                            promos.BetSettled(game.GameId, p.PlayerId, p.Username, p.Currency, round.Id.ToString(), p.Stake, ret, freeBet: false);
+                        }
                         else
                         {
                             pending = true;
@@ -349,22 +411,19 @@ public sealed class MarginCallEngine(
 
     /// <summary>
     /// P/L = stake × multiplier × move, move measured from entry (ask/bid) to exit (bid/ask), loss capped at the stake.
-    /// Return = stake + P/L − commission, never below zero. Rounded down to the cent.
+    /// Return = stake + P/L − commission, never below zero. Rounded down to the cent. Spread and commission are the
+    /// ones the position opened with.
     /// </summary>
     private (double Exit, decimal Commission, decimal Return) Settle(MarginPosition p, double crashMid)
     {
         var buy  = p.Direction == "BUY";
-        var exit = buy ? Bid(crashMid) : Ask(crashMid);
+        var exit = buy ? crashMid * (1 - p.HalfSpread) : crashMid * (1 + p.HalfSpread);
         var move = buy ? (exit - p.EntryPrice) / p.EntryPrice : (p.EntryPrice - exit) / p.EntryPrice;
         var pnl  = Math.Max(-(double)p.Stake, (double)p.Stake * p.Multiplier * move);
-        var commission = Math.Round(p.Stake * _opt.CommissionPercent / 100m, 2, MidpointRounding.ToZero);
+        var commission = Math.Round(p.Stake * p.CommissionPercent / 100m, 2, MidpointRounding.ToZero);
         var ret = Math.Max(0m, Math.Round(p.Stake + (decimal)pnl - commission, 2, MidpointRounding.ToZero));
         return (exit, commission, ret);
     }
-
-    private double HalfSpread => _opt.SpreadBps / 20000.0;
-    private double Ask(double mid) => mid * (1 + HalfSpread);
-    private double Bid(double mid) => mid * (1 - HalfSpread);
 
     private static object PositionDto(MarginPosition p) => new
     {
@@ -376,5 +435,6 @@ public sealed class MarginCallEngine(
         multiplier = p.Multiplier,
         entryPrice = p.EntryPrice,
         openedAt   = p.OpenedAt,
+        freeBet    = p.FreeBet != null,
     };
 }

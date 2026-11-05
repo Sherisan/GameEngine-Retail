@@ -1,3 +1,4 @@
+using Worldiator.Server.Application.Promotions;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Domain;
 
@@ -13,6 +14,9 @@ public class GameEngine
     private readonly IRNGService _rng;
     private readonly IRGSAdapter _rgs;
     private readonly IRoundRepository _rounds;
+    private readonly IGameConfigStore _gameConfig;
+    private readonly IGameRegistry _games;
+    private readonly PromoEngine _promos;
     private GameConfig _config;
     private readonly ILogger<GameEngine> _logger;
 
@@ -29,11 +33,14 @@ public class GameEngine
     public int WaitingSeconds => _config.WaitingSeconds;
     public GameConfig Config => _config;
 
-    public void UpdateLimits(decimal minBet, decimal maxBet, decimal maxWin)
+    /// <summary>
+    /// Bet limits for a game played on this engine (Feeding Frenzy, Comet Rider): its catalogue entry from the
+    /// back office, or the GameConfig section when the game isn't in the catalogue.
+    /// </summary>
+    public (decimal MinBet, decimal MaxBet, decimal MaxWin) LimitsFor(string? gameId)
     {
-        _config.MinBet = minBet;
-        _config.MaxBet = maxBet;
-        _config.MaxWin = maxWin;
+        var game = _games.Find(gameId ?? SessionTokenService.DefaultGameId);
+        return game != null ? (game.MinBet, game.MaxBet, game.MaxWin) : (_config.MinBet, _config.MaxBet, _config.MaxWin);
     }
 
     public event Func<Round, Task>? OnRoundStarted;
@@ -45,12 +52,18 @@ public class GameEngine
         IRNGService rng,
         IRGSAdapter rgs,
         IRoundRepository rounds,
+        IGameConfigStore gameConfig,
+        IGameRegistry games,
+        PromoEngine promos,
         IConfiguration config,
         ILogger<GameEngine> logger)
     {
         _rng = rng;
         _rgs = rgs;
         _rounds = rounds;
+        _gameConfig = gameConfig;
+        _games = games;
+        _promos = promos;
         _logger = logger;
         _config = new GameConfig
         {
@@ -97,6 +110,12 @@ public class GameEngine
         if (round == null) return;
 
         _rounds.Add(round);
+
+        // The round broke rather than crashed: free bets that hadn't cashed out go back to their players.
+        List<Bet> unsettled;
+        lock (_lock) unsettled = round.Bets.Where(b => b.FreeBet != null && b.CashedOutAt == null).ToList();
+        foreach (var bet in unsettled)
+            await _promos.ReleaseFreeBetAsync(bet.FreeBet!);
 
         if (OnRoundCrashed != null)
         {
@@ -195,79 +214,128 @@ public class GameEngine
         }
 
         _rounds.Add(round);
+        ReportRoundEnded(round);
 
         if (OnRoundCrashed != null) await OnRoundCrashed(round);
     }
 
     public async Task<(bool success, string error)> PlaceBetAsync(
         string playerId, string username, string currency,
-        decimal amount, int slot, decimal? autoCashOut, string? gameId = null)
+        decimal amount, int slot, decimal? autoCashOut, string? gameId = null, bool freeBet = false)
     {
-        Bet bet;
-        string roundId;
+        var promoGame = gameId ?? SessionTokenService.DefaultGameId;
 
-        lock (_lock)
+        // A free bet's stake is the promo's, not the player's: claim one first; its value is the bet amount.
+        Domain.Promotions.PromoAward? free = null;
+        if (freeBet)
         {
-            if (_currentRound == null || _currentRound.Phase != GamePhase.Waiting)
-                return (false, "Betting is closed");
-            if (amount <= 0)
-                return (false, "Bet amount must be positive");
-            if (amount < _config.MinBet || amount > _config.MaxBet)
-                return (false, $"Bet must be between {_config.MinBet} and {_config.MaxBet}");
-            if (autoCashOut.HasValue && autoCashOut.Value < 1.01m)
-                return (false, "Auto cash out must be at least 1.01x");
-            if (_currentRound.Bets.Any(b => b.PlayerId == playerId && b.SlotIndex == slot))
-                return (false, "Bet already placed for this slot");
+            lock (_lock)
+                if (_currentRound == null || _currentRound.Phase != GamePhase.Waiting)
+                    return (false, "Betting is closed");
+            free = await _promos.ClaimFreeBetAsync(new PlayerSession(playerId, username, currency, promoGame), promoGame);
+            if (free == null) return (false, "You have no free bet for this game");
+            amount = free.Amount;
+        }
 
-            bet = new Bet
+        var (ok, error, bet, roundId) = Reserve();
+        if (!ok)
+        {
+            if (free != null) await _promos.ReleaseFreeBetAsync(free);
+            return (false, error);
+        }
+
+        if (free == null)
+        {
+            try
             {
-                RoundId = _currentRound.RoundId,
-                PlayerId = playerId,
-                Username = username,
-                Currency = currency,
-                SlotIndex = slot,
-                Amount = amount,
-                AutoCashOutAt = autoCashOut,
-                GameId = gameId,
-            };
-            roundId = _currentRound.RoundId;
-        }
-
-        try
-        {
-            var txId = await _rgs.DebitAsync(playerId, amount, currency, roundId, $"BET_{bet.BetId}", bet.GameId);
-            bet.DebitTransactionId = txId;
-        }
-        catch (RGSException ex)
-        {
-            _logger.LogWarning("RGS debit failed for {PlayerId}: {Message}", playerId, ex.Message);
-            return (false, ex.Message);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "RGS debit error for {PlayerId}", playerId);
-            return (false, "Wallet error, please try again");
-        }
-
-        lock (_lock)
-        {
-            if (_currentRound == null || _currentRound.Phase != GamePhase.Waiting)
-            {
-                _ = SafeRollbackAsync(playerId, bet.DebitTransactionId!, roundId, amount, currency, bet.GameId);
-                return (false, "Betting closed");
+                var txId = await _rgs.DebitAsync(playerId, amount, currency, roundId, $"BET_{bet!.BetId}", bet.GameId);
+                bet.DebitTransactionId = txId;
             }
+            catch (RGSException ex)
+            {
+                _logger.LogWarning("RGS debit failed for {PlayerId}: {Message}", playerId, ex.Message);
+                return (false, ex.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "RGS debit error for {PlayerId}", playerId);
+                return (false, "Wallet error, please try again");
+            }
+        }
+
+        string? lateError = null;
+        lock (_lock)
+        {
+            if (_currentRound == null || _currentRound.Phase != GamePhase.Waiting)
+                lateError = "Betting closed";
             // Re-check after async debit — two concurrent calls can both pass the first guard.
-            if (_currentRound.Bets.Any(b => b.PlayerId == playerId && b.SlotIndex == slot))
+            else if (_currentRound.Bets.Any(b => b.PlayerId == playerId && b.SlotIndex == slot))
+                lateError = "Bet already placed for this slot";
+            else
             {
-                _ = SafeRollbackAsync(playerId, bet.DebitTransactionId!, roundId, amount, currency, bet.GameId);
-                return (false, "Bet already placed for this slot");
+                _currentRound.Bets.Add(bet!);
+                if (bet!.AutoCashOutAt.HasValue)
+                    AddToAutoCashoutQueue(bet);
             }
-            _currentRound.Bets.Add(bet);
-            if (bet.AutoCashOutAt.HasValue)
-                AddToAutoCashoutQueue(bet);
+        }
+        if (lateError != null)
+        {
+            if (free != null) await _promos.ReleaseFreeBetAsync(free);
+            else _ = SafeRollbackAsync(playerId, bet!.DebitTransactionId!, roundId, amount, currency, bet.GameId);
+            return (false, lateError);
         }
 
+        _promos.BetPlaced(promoGame, playerId, username, currency, amount, freeBet: free != null);
         return (true, string.Empty);
+
+        (bool Ok, string Error, Bet? Bet, string RoundId) Reserve()
+        {
+            lock (_lock)
+            {
+                if (_currentRound == null || _currentRound.Phase != GamePhase.Waiting)
+                    return (false, "Betting is closed", null, "");
+                if (amount <= 0)
+                    return (false, "Bet amount must be positive", null, "");
+                var (minBet, maxBet, _) = LimitsFor(gameId);
+                // Free bets are fixed by the promotion, so the table limits don't apply to them.
+                if (free == null && (amount < minBet || amount > maxBet))
+                    return (false, $"Bet must be between {minBet} and {maxBet}", null, "");
+                if (autoCashOut.HasValue && autoCashOut.Value < 1.01m)
+                    return (false, "Auto cash out must be at least 1.01x", null, "");
+                if (_currentRound.Bets.Any(b => b.PlayerId == playerId && b.SlotIndex == slot))
+                    return (false, "Bet already placed for this slot", null, "");
+
+                return (true, "", new Bet
+                {
+                    RoundId = _currentRound.RoundId,
+                    PlayerId = playerId,
+                    Username = username,
+                    Currency = currency,
+                    SlotIndex = slot,
+                    Amount = amount,
+                    AutoCashOutAt = autoCashOut,
+                    GameId = gameId,
+                    FreeBet = free,
+                }, _currentRound.RoundId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Tells the promo engine the round is over: free bets still riding at the crash have lost, and each game sharing
+    /// this round (Feeding Frenzy, Comet Rider) gets its own round-end report for drops and jackpots.
+    /// </summary>
+    private void ReportRoundEnded(Round round)
+    {
+        List<Bet> bets;
+        lock (_lock) bets = round.Bets.ToList();
+
+        foreach (var lost in bets.Where(b => b.FreeBet != null && b.CashedOutAt == null))
+            _ = _promos.SettleFreeBetAsync(lost.FreeBet!, round.RoundId, 0);
+
+        foreach (var game in bets.GroupBy(b => b.GameId ?? SessionTokenService.DefaultGameId))
+            _promos.RoundEnded(game.Key, round.RoundId, round.CrashMultiplier,
+                game.Select(b => new PromoBet(b.PlayerId, b.Username, b.Currency, b.Amount, b.FreeBet != null)).ToList());
     }
 
     public async Task<(bool success, decimal winAmount, string error)> CashOutAsync(string playerId, int slot)
@@ -307,6 +375,15 @@ public class GameEngine
             bet.WinAmount = Math.Round(bet.Amount * effective, 2);
         }
 
+        if (bet.FreeBet != null)
+        {
+            // Promo money: the promotion pays what it allows (normally the winnings above the stake) and retries
+            // its own payout if the wallet is down, so this cash-out always stands.
+            bet.WinAmount = await _promos.SettleFreeBetAsync(bet.FreeBet, bet.RoundId, bet.WinAmount!.Value);
+            if (OnBetCashedOut != null) await OnBetCashedOut(bet);
+            return (true, bet.WinAmount!.Value, string.Empty);
+        }
+
         try
         {
             var txId = await _rgs.CreditAsync(
@@ -327,6 +404,8 @@ public class GameEngine
             return (false, 0, "Wallet credit failed, please try again");
         }
 
+        _promos.BetSettled(bet.GameId ?? SessionTokenService.DefaultGameId, bet.PlayerId, bet.Username, bet.Currency,
+            bet.RoundId, bet.Amount, bet.WinAmount!.Value, freeBet: false);
         if (OnBetCashedOut != null) await OnBetCashedOut(bet);
         return (true, bet.WinAmount!.Value, string.Empty);
     }
@@ -361,6 +440,7 @@ public class GameEngine
             if (bet == null)                    return (false, false, 0, "No bet found for this slot");
             if (bet.CashedOutAt == null)        return (false, false, 0, "Cash out first before gambling");
             if (bet.HasGambled)                 return (false, false, 0, "Already gambled this round");
+            if (bet.FreeBet != null)            return (false, false, 0, "Free bet winnings can't be gambled");
             if (bet.WinAmount == null || bet.WinAmount <= 0) return (false, false, 0, "No winnings to gamble");
 
             bet.HasGambled = true;
@@ -404,7 +484,7 @@ public class GameEngine
             if (ev.IsBomb) return (false, 0, "That is a mine");
             if (elapsed < ev.TimeMs - 1000 || elapsed > ev.TimeMs + ev.DurationMs + 1500)
                 return (false, 0, "Fish not in play");
-            if (ev.Tier >= PlayerTierIndex(MsToMultiplier(elapsed)))
+            if (ev.Tier >= PlayerTierIndex(bet.GameId, MsToMultiplier(elapsed)))
                 return (false, 0, "Fish too big to eat");
             if (!bet.EatenFishIds.Add(fishId)) return (false, 0, "Already eaten");
             if (bet.BoostMultiplier >= (decimal)SpawnSchedule.MaxBoost)
@@ -447,9 +527,16 @@ public class GameEngine
         return (bet, (DateTime.UtcNow - flyingStart).TotalMilliseconds, string.Empty);
     }
 
-    /// <summary>Player tier index at a multiplier: 1=clownfish … 5=whale shark (mirrors client fishTiers.ts).</summary>
-    private static int PlayerTierIndex(double multiplier) =>
-        multiplier >= 25 ? 5 : multiplier >= 10 ? 4 : multiplier >= 5 ? 3 : multiplier >= 2 ? 2 : 1;
+    /// <summary>
+    /// Player tier index at a multiplier: 1=clownfish … 5=whale shark, from the game's evolution ladder set in
+    /// the back office (the frontend applies the same ladder in fishTiers.ts / tiers.ts).
+    /// </summary>
+    private int PlayerTierIndex(string? gameId, double multiplier)
+    {
+        var tiers = _gameConfig.GetEvolutionTiers(gameId ?? SessionTokenService.DefaultGameId);
+        if (tiers.Count == 0) tiers = _gameConfig.GetEvolutionTiers(SessionTokenService.DefaultGameId);
+        return EvolutionTiers.LevelAt(tiers, multiplier);
+    }
 
     public List<Bet> GetCurrentBets()
     {

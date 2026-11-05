@@ -43,11 +43,12 @@ public class GameController : ControllerBase
         return Ok(rounds.Select(HistoryEntryDto.From));
     }
 
+    /// <summary>Bet limits for a /gamehub game (default Feeding Frenzy), as set in the Game Back Office.</summary>
     [HttpGet("limits")]
-    public IActionResult GetLimits()
+    public IActionResult GetLimits([FromQuery] string? gameId = null)
     {
-        var config = _engine.Config;
-        return Ok(new { minBet = config.MinBet, maxBet = config.MaxBet, maxWin = config.MaxWin });
+        var (minBet, maxBet, maxWin) = _engine.LimitsFor(gameId);
+        return Ok(new { minBet, maxBet, maxWin });
     }
 
     /// <summary>The calling player's own bet history. Identity from JWT only — never a query param.</summary>

@@ -30,7 +30,7 @@ public class MarginCallHub(MarginCallEngine engine, WalletService wallet, ILogge
     {
         var player = Player();
         var game   = engine.Game ?? throw new HubException("Game is not enabled.");
-        var opt    = engine.Options;
+        var opt    = engine.Trading;
 
         decimal? balance = null;
         try { balance = await wallet.GetBalanceAsync(player); }
@@ -58,6 +58,13 @@ public class MarginCallHub(MarginCallEngine engine, WalletService wallet, ILogge
     public async Task<object> OpenPosition(string market, string direction, decimal stake, int multiplier)
     {
         var (position, balance, error) = await engine.OpenPositionAsync(Player(), market, direction, stake, multiplier);
+        return new { ok = error == null, position, balance, error };
+    }
+
+    /// <summary>Opens a position with one of the player's promo free bets (its value is the stake). See PromoHub.</summary>
+    public async Task<object> OpenFreePosition(string market, string direction, int multiplier)
+    {
+        var (position, balance, error) = await engine.OpenPositionAsync(Player(), market, direction, 0, multiplier, freeBet: true);
         return new { ok = error == null, position, balance, error };
     }
 

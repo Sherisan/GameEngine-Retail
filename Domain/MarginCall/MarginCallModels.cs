@@ -30,6 +30,12 @@ public class MarginPosition
     public int Multiplier { get; init; }
     /// <summary>Price the position opened at, spread included (ask for BUY, bid for SELL).</summary>
     public double EntryPrice { get; init; }
+    /// <summary>Half the spread as a fraction of price, as it was when the position opened (the exit pays it too).</summary>
+    public double HalfSpread { get; init; }
+    /// <summary>Commission % as it was when the position opened.</summary>
+    public decimal CommissionPercent { get; init; }
+    /// <summary>Set for a promo free bet: nothing was debited, and the promotion settles it.</summary>
+    public Promotions.PromoAward? FreeBet { get; init; }
     public long OpenedAt { get; init; }
 }
 

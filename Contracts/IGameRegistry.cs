@@ -2,7 +2,7 @@ using Worldiator.Server.Domain;
 
 namespace Worldiator.Server.Contracts;
 
-/// <summary>The games this API can launch and hold wallet sessions for.</summary>
+/// <summary>The games this API can launch and hold wallet sessions for. Backed by the back-office config store, so it can change at runtime.</summary>
 public interface IGameRegistry
 {
     IReadOnlyList<GameDefinition> All { get; }

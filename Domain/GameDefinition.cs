@@ -1,5 +1,11 @@
+using System.Text.Json.Serialization;
+using Worldiator.Server.Domain.MarginCall;
+using Worldiator.Server.Domain.Blackjack;
+using Worldiator.Server.Domain.Defuse;
+
 namespace Worldiator.Server.Domain;
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum GameType { Crash, Slot, Prediction, Scratch, Table }
 
 /// <summary>
@@ -9,9 +15,14 @@ public enum GameType { Crash, Slot, Prediction, Scratch, Table }
 ///   LiveCrash  — shared rounds on /livecrashhub: bet, watch the multiplier climb, cash out before the crash (Rng: Target).
 ///   MarginCall — the trading crash game on /margincallhub (Rng: Target, optional — sets round length only).
 ///   Roulette   — on-demand European roulette through api/roulette: many bets per spin, one draw (Rng: Wheel).
+///   Blackjack  — on-demand blackjack through api/blackjack, one player against the dealer. Each hand is dealt from a
+///                freshly shuffled shoe with its own provably-fair seed (no Rng block).
+///   Defuse     — DEFUSE through api/defuse: cut wires one at a time, cash out before the detonator. Fixed 97% ladder
+///                (DefuseRules) and its own provably-fair seed per round (no Rng block).
 ///   Custom     — has its own engine and RNG (Feeding Frenzy) or its own backend.
 /// </summary>
-public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom }
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom, Blackjack, Defuse }
 
 /// <summary>
 /// A game that can be launched through this API and use its shared wallet endpoints.
@@ -62,9 +73,21 @@ public class GameDefinition
     /// <summary>Table limits for Engine = Roulette. Defaults apply when omitted.</summary>
     public RouletteSettings? Roulette { get; set; }
 
+    /// <summary>Markets, house edge and round timing for Engine = MarginCall. Null = the appsettings "MarginCall" section.</summary>
+    public TradingSettings? Trading { get; set; }
+
+    /// <summary>Table rules for Engine = Blackjack. Defaults apply when omitted.</summary>
+    public BlackjackSettings? Blackjack { get; set; }
+
     public void Validate()
     {
         void Fail(string msg) => throw new InvalidOperationException($"Games[{GameId}]: {msg}");
+        if (string.IsNullOrWhiteSpace(Name)) Fail("Name is required.");
+        if (MinBet <= 0 || MaxBet < MinBet || MaxWin <= 0) Fail("Limits need MinBet > 0, MaxBet >= MinBet and MaxWin > 0.");
+        if (MinBet != Math.Round(MinBet, 2) || MaxBet != Math.Round(MaxBet, 2) || MaxWin != Math.Round(MaxWin, 2))
+            Fail("MinBet, MaxBet and MaxWin can have at most 2 decimals.");
+        if (LaunchUrl.Length > 0 && !(Uri.TryCreate(LaunchUrl, UriKind.Absolute, out var url) && url.Scheme is "http" or "https"))
+            Fail("LaunchUrl must be an absolute http(s) URL, or empty.");
         Rng?.Validate(GameId);
         switch (Engine)
         {
@@ -80,15 +103,29 @@ public class GameDefinition
             case EngineKind.MarginCall:
                 if (Rng != null && Rng.Model != RngModel.Target)
                     Fail("Engine MarginCall takes an Rng block with Model Target, or none.");
+                Trading?.Validate(GameId);
                 break;
             case EngineKind.Roulette:
                 if (Rng?.Model != RngModel.Wheel)
                     Fail("Engine Roulette needs an Rng block with Model Wheel (it draws the winning pocket).");
                 (Roulette ??= new RouletteSettings()).Validate(GameId, MaxBet);
                 break;
+            case EngineKind.Blackjack:
+                if (Rng != null) Fail("Engine Blackjack shuffles its own provably-fair shoe — remove the Rng block.");
+                (Blackjack ??= new BlackjackSettings()).Validate(GameId);
+                break;
+            case EngineKind.Defuse:
+                if (Rng != null) Fail("Engine Defuse draws its own provably-fair detonator — remove the Rng block.");
+                if (MaxWin < MaxBet * DefuseRules.TopMultiplier)
+                    Fail($"MaxWin {MaxWin} is below MaxBet × {DefuseRules.TopMultiplier} — a full defuse couldn't be paid.");
+                break;
         }
         if (Rng?.Model == RngModel.Wheel && Engine != EngineKind.Roulette)
             Fail("Rng Model Wheel is only used by Engine Roulette.");
+        if (Trading != null && Engine != EngineKind.MarginCall)
+            Fail("Trading is only used by Engine MarginCall.");
+        if (Blackjack != null && Engine != EngineKind.Blackjack)
+            Fail("Blackjack is only used by Engine Blackjack.");
     }
 }
 
@@ -160,6 +197,7 @@ public class LiveCrashSettings
 ///   Target     — the player picks a target multiplier, the RNG draws a crash point; crash ≥ target pays target (instant crash / limbo).
 ///   Wheel      — the RNG draws one of Pockets equally likely pockets (draw = pocket number); used by Engine Roulette.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum RngModel { Multiplier, Pick, Target, Wheel }
 
 public class RngSettings
@@ -226,6 +264,8 @@ public class RngSettings
                 break;
         }
         if (RotateSeedEvery < 1) Fail("RotateSeedEvery must be >= 1.");
+        // A table that returns more than it takes in loses money on every play — almost always a typo in a weight.
+        if (Rtp > 1m) Fail(FormattableString.Invariant($"RTP is {Rtp * 100:0.##}% — above 100%, the game would pay out more than it takes in."));
         if (Card != null)
         {
             if (Model != RngModel.Multiplier) Fail("Card layouts need the Multiplier model.");

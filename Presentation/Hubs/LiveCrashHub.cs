@@ -69,6 +69,14 @@ public class LiveCrashHub(LiveCrashRegistry registry, WalletService wallet, ILog
         return new { ok = error == null, bet, balance, error };
     }
 
+    /// <summary>Bets one of the player's promo free bets (its value is the stake). See PromoHub for the free bets they have.</summary>
+    public async Task<object> PlaceFreeBet(int slot, decimal? autoCashOut)
+    {
+        var (player, engine) = Resolve();
+        var (bet, balance, error) = await engine.PlaceBetAsync(player, slot, 0, autoCashOut, freeBet: true);
+        return new { ok = error == null, bet, balance, error };
+    }
+
     public async Task<object> CancelBet(int slot)
     {
         var (player, engine) = Resolve();

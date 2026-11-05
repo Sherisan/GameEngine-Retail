@@ -5,8 +5,11 @@ using StackExchange.Redis;
 using System.Text;
 using System.Threading.RateLimiting;
 using Worldiator.Server.Application;
+using Worldiator.Server.Application.Blackjack;
+using Worldiator.Server.Application.Defuse;
 using Worldiator.Server.Application.LiveCrash;
 using Worldiator.Server.Application.MarginCall;
+using Worldiator.Server.Application.Promotions;
 using Worldiator.Server.Background;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Domain;
@@ -56,14 +59,43 @@ builder.Services
                 var token = ctx.Request.Query["access_token"];
                 if (!string.IsNullOrEmpty(token) &&
                     (ctx.Request.Path.StartsWithSegments("/gamehub") || ctx.Request.Path.StartsWithSegments("/margincallhub")
-                     || ctx.Request.Path.StartsWithSegments("/livecrashhub")))
+                     || ctx.Request.Path.StartsWithSegments("/livecrashhub") || ctx.Request.Path.StartsWithSegments("/promohub")))
                     ctx.Token = token;
                 return Task.CompletedTask;
             }
         };
     });
 
-builder.Services.AddAuthorization();
+// ─── Game Back Office sign-in ─────────────────────────────────────────────────
+// Its own bearer scheme and audience (see BackOfficeAuthService): player tokens can't open the back office and
+// back-office tokens can't play. Every request re-checks the account, so disable / role change / password reset
+// apply immediately. Viewer < Editor < Admin.
+builder.Services.AddAuthentication()
+    .AddJwtBearer(BackOfficeAuthService.Scheme, opt =>
+    {
+        opt.MapInboundClaims = false;
+        opt.TokenValidationParameters = BackOfficeAuthService.ValidationParameters(builder.Configuration);
+        opt.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async ctx =>
+            {
+                var principal = await ctx.HttpContext.RequestServices.GetRequiredService<BackOfficeAuthService>()
+                    .RevalidateAsync(ctx.Principal!);
+                if (principal == null) ctx.Fail("Back office account disabled, changed or removed.");
+                else ctx.Principal = principal;
+            },
+        };
+    });
+
+builder.Services.AddAuthorization(opt =>
+{
+    void BackOfficePolicy(string name, params BackOfficeRole[] roles) =>
+        opt.AddPolicy(name, p => p.AddAuthenticationSchemes(BackOfficeAuthService.Scheme)
+                                  .RequireRole(roles.Select(r => r.ToString())));
+    BackOfficePolicy(BackOfficeAuthService.ViewerPolicy, BackOfficeRole.Viewer, BackOfficeRole.Editor, BackOfficeRole.Admin);
+    BackOfficePolicy(BackOfficeAuthService.EditorPolicy, BackOfficeRole.Editor, BackOfficeRole.Admin);
+    BackOfficePolicy(BackOfficeAuthService.AdminPolicy, BackOfficeRole.Admin);
+});
 
 // ─── Redis ────────────────────────────────────────────────────────────────────
 var redisConnStr = builder.Configuration["Redis:ConnectionString"];
@@ -144,6 +176,33 @@ void AddOperatorWallet<TAdapter>() where TAdapter : class, IRGSAdapter
     }
 }
 
+// ─── Game Back Office config ─────────────────────────────────────────────────
+// Every game's settings (the catalogue: limits, RNG tables, timings…) and the evolution ladders, edited through
+// api/backoffice. Stored in SQL (Infrastructure/Persistence/GameConfiguration.sql + GameCatalogue.sql), seeded from
+// the "Games" array in appsettings, and refreshed on every instance in the background.
+if (!string.IsNullOrEmpty(sqlConnStr))
+    builder.Services.AddSingleton<IGameConfigStore, SqlGameConfigStore>();
+else
+    builder.Services.AddSingleton<IGameConfigStore, InMemoryGameConfigStore>();
+builder.Services.AddHostedService<GameConfigRefreshService>();
+// Back-office accounts (Infrastructure/Persistence/BackOfficeUsers.sql).
+if (!string.IsNullOrEmpty(sqlConnStr))
+    builder.Services.AddSingleton<IBackOfficeUserStore, SqlBackOfficeUserStore>();
+else
+    builder.Services.AddSingleton<IBackOfficeUserStore, InMemoryBackOfficeUserStore>();
+builder.Services.AddSingleton<BackOfficeAuthService>();
+IGameConfigStore? gameConfigForCors = null; // set once the app is built — see the CORS policy
+
+// ─── Promotions ───────────────────────────────────────────────────────────────
+// Promo tools for the crash games (free bets, rain, round drops, leaderboards, races, jackpots), managed from the
+// back office (api/backoffice/promotions) and shown to players on /promohub. See PromoEngine.
+if (!string.IsNullOrEmpty(sqlConnStr))
+    builder.Services.AddSingleton<IPromoStore, SqlPromoStore>();
+else
+    builder.Services.AddSingleton<IPromoStore, InMemoryPromoStore>();
+builder.Services.AddSingleton<PromoEngine>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PromoEngine>());
+
 // ─── Core Application Services ───────────────────────────────────────────────
 builder.Services.AddSingleton<IRoundRepository, InMemoryRoundRepository>();
 builder.Services.AddSingleton<IChatService, ChatService>();
@@ -152,8 +211,8 @@ builder.Services.AddHostedService<GameHostedService>();
 
 // ─── Multi-game platform ─────────────────────────────────────────────────────
 // Other crash / slot / prediction games launch through api/games/launch and settle
-// through api/wallet/* (see WalletController). Games are listed under "Games".
-builder.Services.AddSingleton<IGameRegistry, ConfigGameRegistry>();
+// through api/wallet/* (see WalletController). The catalogue comes from the Game Back Office config store.
+builder.Services.AddSingleton<IGameRegistry, StoreGameRegistry>();
 builder.Services.AddSingleton<SessionTokenService>();
 if (!string.IsNullOrEmpty(sqlConnStr))
     builder.Services.AddSingleton<IWalletLedger, SqlWalletLedger>();
@@ -165,6 +224,12 @@ builder.Services.AddSingleton<IGameRngService, EasyGameRngService>();
 builder.Services.AddScoped<PlayService>();
 // Engine = Roulette games spin through api/roulette (many bets, one draw per spin).
 builder.Services.AddScoped<RouletteService>();
+// Engine = Blackjack games deal through api/blackjack (one player against the dealer, provably-fair shoe per round).
+builder.Services.AddSingleton<BlackjackService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BlackjackService>());
+// Engine = Defuse games play through api/defuse (cut wires, cash out before the detonator).
+builder.Services.AddSingleton<DefuseService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DefuseService>());
 
 // ─── Margin Call (TradeX) — live trading crash game ─────────────────────────
 // Server-authoritative markets, rounds and settlement on /margincallhub. See MarginCallEngine.
@@ -261,16 +326,16 @@ builder.Services.AddCors(options =>
                     : null;
             }
 
-            // Each game's frontend reads the player balance from api/wallet/balance, so its origin is allowed too.
-            var gameOrigins = (builder.Configuration.GetSection("Games").Get<List<GameDefinition>>() ?? [])
-                .Where(g => Uri.TryCreate(g.LaunchUrl, UriKind.Absolute, out _))
-                .Select(g => new Uri(g.LaunchUrl).GetLeftPart(UriPartial.Authority));
             if (allowedOrigins != null && allowedOrigins.Length > 0)
-                allowedOrigins = allowedOrigins.Concat(gameOrigins).Distinct().ToArray();
-
-            if (allowedOrigins != null && allowedOrigins.Length > 0)
-                policy.WithOrigins(allowedOrigins)
+            {
+                // Each game's frontend reads the player balance from api/wallet/balance, so its origin is allowed too.
+                // Read from the catalogue on every check, so a LaunchUrl set in the back office works straight away.
+                var fixedOrigins = allowedOrigins.Select(o => o.TrimEnd('/')).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                policy.SetIsOriginAllowed(origin => fixedOrigins.Contains(origin)
+                          || (gameConfigForCors?.Games.Any(g => Uri.TryCreate(g.LaunchUrl, UriKind.Absolute, out var url)
+                                 && string.Equals(url.GetLeftPart(UriPartial.Authority), origin, StringComparison.OrdinalIgnoreCase)) ?? false))
                       .AllowAnyHeader().AllowAnyMethod().AllowCredentials();
+            }
             else
                 policy.SetIsOriginAllowed(_ => true)
                       .AllowAnyHeader().AllowAnyMethod().AllowCredentials();
@@ -279,6 +344,24 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Load the game catalogue and evolution ladders from SQL (importing any appsettings game it doesn't have yet)
+// before the game engines start. If SQL is unreachable the API starts on appsettings + built-in values and
+// GameConfigRefreshService keeps retrying.
+var gameConfig = app.Services.GetRequiredService<IGameConfigStore>();
+gameConfigForCors = gameConfig;
+try { await gameConfig.InitializeAsync(); }
+catch (Exception ex)
+{
+    app.Logger.LogError(ex, "Game config could not be loaded from the database — starting with appsettings / built-in values");
+}
+
+// First back-office Admin, from BackOffice:BootstrapAdmin, when there are no accounts yet.
+try { await app.Services.GetRequiredService<BackOfficeAuthService>().BootstrapAsync(app.Configuration); }
+catch (Exception ex)
+{
+    app.Logger.LogError(ex, "Back office accounts could not be read — run Infrastructure/Persistence/BackOfficeUsers.sql");
+}
 
 app.Use(async (ctx, next) =>
 {
@@ -297,6 +380,7 @@ app.MapControllers().RequireRateLimiting("api");
 app.MapHub<GameHub>("/gamehub");
 app.MapHub<MarginCallHub>("/margincallhub");
 app.MapHub<LiveCrashHub>("/livecrashhub");
+app.MapHub<PromoHub>("/promohub");
 app.MapHealthChecks("/health");
 
 // Session creation (called by Games-API on game launch) lives in AuthController

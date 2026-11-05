@@ -51,7 +51,13 @@ public class GameHub : Hub
     private string? GameId => Context.User?.FindFirst(SessionTokenService.GameClaim)?.Value;
 
     [EnableRateLimiting("bet")]
-    public async Task PlaceBet(decimal amount, int slot, decimal? autoCashOut)
+    public Task PlaceBet(decimal amount, int slot, decimal? autoCashOut) => Place(amount, slot, autoCashOut, freeBet: false);
+
+    /// <summary>Bets one of the player's promo free bets (its value is the stake). See PromoHub for the free bets they have.</summary>
+    [EnableRateLimiting("bet")]
+    public Task PlaceFreeBet(int slot, decimal? autoCashOut) => Place(0, slot, autoCashOut, freeBet: true);
+
+    private async Task Place(decimal amount, int slot, decimal? autoCashOut, bool freeBet)
     {
         if (slot < 0 || slot > 1)
         {
@@ -59,7 +65,7 @@ public class GameHub : Hub
             return;
         }
         var (playerId, username, currency) = GetPlayerContext();
-        var (success, error) = await _engine.PlaceBetAsync(playerId, username, currency, amount, slot, autoCashOut, GameId);
+        var (success, error) = await _engine.PlaceBetAsync(playerId, username, currency, amount, slot, autoCashOut, GameId, freeBet);
         if (success)
         {
             var bet = _engine.GetBet(playerId, slot);
@@ -67,7 +73,7 @@ public class GameHub : Hub
                 await Clients.All.SendAsync("BetAdded", BetAddedDto.From(bet));
 
             var balance = await _rgs.GetBalanceAsync(playerId, currency, GameId);
-            await Clients.Caller.SendAsync("BetPlaced", new { slot, amount, balance, success = true });
+            await Clients.Caller.SendAsync("BetPlaced", new { slot, amount = bet?.Amount ?? amount, balance, success = true, freeBet });
         }
         else
         {

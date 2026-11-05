@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.SignalR;
+using Worldiator.Server.Application.Promotions;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Domain;
+using Worldiator.Server.Domain.Promotions;
 using Worldiator.Server.Presentation.Hubs;
 
 namespace Worldiator.Server.Application.LiveCrash;
@@ -27,9 +29,11 @@ public enum LiveBetStatus { Pending, Active, CashedOut, Lost, Cancelled }
 /// </summary>
 public sealed class LiveCrashEngine(
     GameDefinition game,
+    IGameRegistry games,
     IGameRngService rng,
     IServiceScopeFactory scopes,
     IHubContext<LiveCrashHub> hub,
+    PromoEngine promos,
     ILogger logger)
 {
     private static readonly long RoundEpoch = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).ToUnixTimeSeconds();
@@ -40,9 +44,14 @@ public sealed class LiveCrashEngine(
     private readonly LinkedList<object> _history = new();
     private LiveRound _round = new() { Status = LiveRoundStatus.CRASHED };
 
-    public GameDefinition Game => game;
+    /// <summary>
+    /// The current definition from the back office (limits, RNG). Round timing (Live) is read once at startup, and
+    /// enabling / disabling a live crash game takes a restart — see LiveCrashRegistry.
+    /// </summary>
+    public GameDefinition Game =>
+        games.All.FirstOrDefault(g => string.Equals(g.GameId, game.GameId, StringComparison.OrdinalIgnoreCase)) ?? game;
     public LiveCrashSettings Settings => _live;
-    public string Group => GroupFor(game.GameId);
+    public string Group => GroupFor(Game.GameId);
     public static string GroupFor(string gameId) => $"live:{gameId}";
     public static string PlayerGroup(string gameId, string playerId) => $"live:{gameId}:p:{playerId}";
 
@@ -52,13 +61,13 @@ public sealed class LiveCrashEngine(
     {
         lock (_lock) StartBetting(Now());
         await hub.Clients.Group(Group).SendAsync("Round", PublicRound(), ct);
-        logger.LogInformation("Live crash engine started: game={GameId}", game.GameId);
+        logger.LogInformation("Live crash engine started: game={GameId}", Game.GameId);
 
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_live.TickMs));
         while (await timer.WaitForNextTickAsync(ct))
         {
             try { await StepAsync(); }
-            catch (Exception ex) { logger.LogError(ex, "Live crash tick failed: game={GameId}", game.GameId); }
+            catch (Exception ex) { logger.LogError(ex, "Live crash tick failed: game={GameId}", Game.GameId); }
         }
     }
 
@@ -69,6 +78,7 @@ public sealed class LiveCrashEngine(
         decimal? tick = null;
         List<(LiveBet Bet, decimal At)> autoCashOuts = [];
         List<LiveBet> losers = [];
+        (long RoundId, decimal CrashPoint, List<LiveBet> Bets)? crashed = null;
 
         lock (_lock)
         {
@@ -102,11 +112,13 @@ public sealed class LiveCrashEngine(
                             b.Status = LiveBetStatus.Lost;
                             losers.Add(b);
                         }
+                        crashed = (_round.Id, _round.CrashPoint,
+                            _bets.Where(b => b.RoundId == _round.Id && b.Status is LiveBetStatus.CashedOut or LiveBetStatus.Lost).ToList());
                         _history.AddFirst(new { roundId = _round.Id, crashPoint = _round.CrashPoint });
                         while (_history.Count > _live.HistorySize) _history.RemoveLast();
                         round = PublicRound();
                         logger.LogInformation("Live crash: game={GameId} round={RoundId} crashed at {CrashPoint}x (nonce {Nonce})",
-                            game.GameId, _round.Id, _round.CrashPoint, _round.Proof.Nonce);
+                            Game.GameId, _round.Id, _round.CrashPoint, _round.Proof.Nonce);
                     }
                     else tick = m;
                     break;
@@ -126,12 +138,18 @@ public sealed class LiveCrashEngine(
         foreach (var (bet, at) in autoCashOuts)
             _ = PayAsync(bet, at);
         foreach (var bet in losers)
+        {
+            if (bet.FreeBet != null) _ = promos.SettleFreeBetAsync(bet.FreeBet, bet.RoundId.ToString(), 0);
             await SendMyBet(bet, balance: null);
+        }
+        if (crashed is { } c)
+            promos.RoundEnded(Game.GameId, c.RoundId.ToString(), c.CrashPoint,
+                c.Bets.Select(b => new PromoBet(b.PlayerId, b.Username, b.Currency, b.Amount, b.FreeBet != null)).ToList());
     }
 
     private void StartBetting(long now)
     {
-        var draw = rng.Draw(game); // this game's own generator
+        var draw = rng.Draw(Game); // this game's own generator
         _round = new LiveRound
         {
             Id          = Math.Max(_round.Id + 1, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - RoundEpoch),
@@ -151,7 +169,7 @@ public sealed class LiveCrashEngine(
 
     private object PublicRound() => new
     {
-        gameId         = game.GameId,
+        gameId         = Game.GameId,
         id             = _round.Id,
         status         = _round.Status.ToString(),
         startedAt      = _round.StartedAt,
@@ -166,7 +184,7 @@ public sealed class LiveCrashEngine(
 
     public object Snapshot(string playerId)
     {
-        var (hash, previous) = rng.GetSeedInfo(game);
+        var (hash, previous) = rng.GetSeedInfo(Game);
         lock (_lock)
         {
             return new
@@ -184,30 +202,66 @@ public sealed class LiveCrashEngine(
 
     // ── Player actions ──────────────────────────────────────────────────────
 
-    public async Task<(object? Bet, decimal? Balance, string? Error)> PlaceBetAsync(PlayerSession player, int slot, decimal amount, decimal? autoCashOut)
+    public async Task<(object? Bet, decimal? Balance, string? Error)> PlaceBetAsync(PlayerSession player, int slot, decimal amount, decimal? autoCashOut, bool freeBet = false)
     {
         if (slot < 0 || slot >= _live.MaxBetsPerPlayer) return (null, null, $"Slot must be 0-{_live.MaxBetsPerPlayer - 1}.");
         if (autoCashOut is { } a && (a < _live.MinAutoCashOut || a != Math.Round(a, 2)))
             return (null, null, FormattableString.Invariant($"Auto cash-out must be at least {_live.MinAutoCashOut} with at most 2 decimals."));
 
+        // A free bet's stake is the promo's: claim one first; its value is the bet amount, and no debit is made.
+        PromoAward? free = null;
+        if (freeBet)
+        {
+            lock (_lock)
+                if (_round.Status != LiveRoundStatus.BETTING) return (null, null, "Betting is closed for this round.");
+            free = await promos.ClaimFreeBetAsync(player, Game.GameId);
+            if (free == null) return (null, null, "You have no free bet for this game.");
+            amount = free.Amount;
+        }
+
         LiveBet bet;
         lock (_lock)
         {
-            if (_round.Status != LiveRoundStatus.BETTING) return (null, null, "Betting is closed for this round.");
-            if (_bets.Any(b => b.PlayerId == player.PlayerId && b.Slot == slot && b.RoundId == _round.Id && b.Status != LiveBetStatus.Cancelled))
-                return (null, null, "You already have a bet in that slot.");
+            string? error = null;
+            if (_round.Status != LiveRoundStatus.BETTING) error = "Betting is closed for this round.";
+            else if (_bets.Any(b => b.PlayerId == player.PlayerId && b.Slot == slot && b.RoundId == _round.Id && b.Status != LiveBetStatus.Cancelled))
+                error = "You already have a bet in that slot.";
+            if (error != null)
+            {
+                if (free != null) _ = promos.ReleaseFreeBetAsync(free);
+                return (null, null, error);
+            }
             // Reserved before the wallet call so a double-click can't place two bets in one slot.
             bet = new LiveBet
             {
                 RoundId = _round.Id, PlayerId = player.PlayerId, Username = player.Username, Currency = player.Currency,
-                Slot = slot, Amount = amount, AutoCashOut = autoCashOut, Status = LiveBetStatus.Pending,
+                Slot = slot, Amount = amount, AutoCashOut = autoCashOut, Status = LiveBetStatus.Pending, FreeBet = free,
             };
             _bets.Add(bet);
         }
 
+        if (free != null)
+        {
+            bool placed;
+            lock (_lock)
+            {
+                placed = _round.Id == bet.RoundId && _round.Status == LiveRoundStatus.BETTING;
+                if (placed) bet.Status = LiveBetStatus.Active;
+                else _bets.Remove(bet);
+            }
+            if (!placed)
+            {
+                await promos.ReleaseFreeBetAsync(free);
+                return (null, null, "The round started before your free bet was placed — you still have it.");
+            }
+            promos.BetPlaced(Game.GameId, player.PlayerId, player.Username, player.Currency, amount, freeBet: true);
+            await hub.Clients.Group(Group).SendAsync("BetPlaced", PublicBet(bet));
+            return (MyBetDto(bet), null, null);
+        }
+
         using var scope = scopes.CreateScope();
         var wallet = scope.ServiceProvider.GetRequiredService<WalletService>();
-        var debit = await wallet.DebitAsync(game, player, bet.RoundId.ToString(), $"{bet.Id}-bet", amount);
+        var debit = await wallet.DebitAsync(Game, player, bet.RoundId.ToString(), $"{bet.Id}-bet", amount);
         if (!debit.Ok)
         {
             lock (_lock) _bets.Remove(bet);
@@ -221,13 +275,14 @@ public sealed class LiveCrashEngine(
             if (accepted) bet.Status = LiveBetStatus.Active;
             else _bets.Remove(bet);
         }
+        if (accepted) promos.BetPlaced(Game.GameId, player.PlayerId, player.Username, player.Currency, amount, freeBet: false);
 
         if (!accepted)
         {
-            var rb = await wallet.RollbackAsync(game, player, $"{bet.Id}-rb", $"{bet.Id}-bet");
+            var rb = await wallet.RollbackAsync(Game, player, $"{bet.Id}-rb", $"{bet.Id}-bet");
             if (!rb.Ok)
                 logger.LogCritical("Live crash rollback FAILED: game={GameId} player={PlayerId} bet={BetId} code={Code}",
-                    game.GameId, player.PlayerId, bet.Id, rb.ErrorCode);
+                    Game.GameId, player.PlayerId, bet.Id, rb.ErrorCode);
             return (null, rb.Balance, "The round started before your bet was placed — your stake was returned.");
         }
 
@@ -246,14 +301,22 @@ public sealed class LiveCrashEngine(
             bet.Status = LiveBetStatus.Cancelled; // out of the round from now on
         }
 
+        if (bet.FreeBet != null)
+        {
+            // Nothing was debited — the free bet just goes back to the player.
+            await promos.ReleaseFreeBetAsync(bet.FreeBet);
+            await SendMyBet(bet, balance: null);
+            return (null, null);
+        }
+
         using var scope = scopes.CreateScope();
         var wallet = scope.ServiceProvider.GetRequiredService<WalletService>();
-        var rb = await wallet.RollbackAsync(game, player, $"{bet.Id}-rb", $"{bet.Id}-bet");
+        var rb = await wallet.RollbackAsync(Game, player, $"{bet.Id}-rb", $"{bet.Id}-bet");
         if (!rb.Ok)
         {
             // Couldn't refund — put the bet back so the stake isn't lost; it plays the round if betting has closed.
             lock (_lock) bet.Status = LiveBetStatus.Active;
-            logger.LogError("Live crash cancel failed: game={GameId} bet={BetId} code={Code}", game.GameId, bet.Id, rb.ErrorCode);
+            logger.LogError("Live crash cancel failed: game={GameId} bet={BetId} code={Code}", Game.GameId, bet.Id, rb.ErrorCode);
             return (null, rb.Error ?? "Could not cancel the bet.");
         }
 
@@ -285,27 +348,41 @@ public sealed class LiveCrashEngine(
 
     private async Task<(decimal Win, decimal? Balance)> PayAsync(LiveBet bet, decimal at)
     {
-        var win = Math.Min(Math.Round(bet.Amount * at, 2, MidpointRounding.ToZero), game.MaxWin);
+        var win = Math.Min(Math.Round(bet.Amount * at, 2, MidpointRounding.ToZero), Game.MaxWin);
         bet.Win = win;
         decimal? balance = null;
+
+        if (bet.FreeBet != null)
+        {
+            // Promo money: the promotion pays what it allows (normally the winnings above the stake) and retries its own payout.
+            bet.Win = await promos.SettleFreeBetAsync(bet.FreeBet, bet.RoundId.ToString(), win);
+            await hub.Clients.Group(Group).SendAsync("CashedOut", PublicBet(bet));
+            await SendMyBet(bet, balance);
+            return (bet.Win.Value, balance);
+        }
+
         try
         {
             using var scope = scopes.CreateScope();
             var wallet = scope.ServiceProvider.GetRequiredService<WalletService>();
-            var player = new PlayerSession(bet.PlayerId, bet.Username, bet.Currency, game.GameId);
-            var credit = await wallet.CreditAsync(game, player, bet.RoundId.ToString(), $"{bet.Id}-win", win);
-            if (credit.Ok) balance = credit.Balance;
+            var player = new PlayerSession(bet.PlayerId, bet.Username, bet.Currency, Game.GameId);
+            var credit = await wallet.CreditAsync(Game, player, bet.RoundId.ToString(), $"{bet.Id}-win", win);
+            if (credit.Ok)
+            {
+                balance = credit.Balance;
+                promos.BetSettled(Game.GameId, bet.PlayerId, bet.Username, bet.Currency, bet.RoundId.ToString(), bet.Amount, win, freeBet: false);
+            }
             else
             {
                 bet.WinPending = true;
                 logger.LogCritical("Live crash win NOT credited: game={GameId} round={RoundId} player={PlayerId} bet={BetId} win={Win} code={Code} error={Error}",
-                    game.GameId, bet.RoundId, bet.PlayerId, bet.Id, win, credit.ErrorCode, credit.Error);
+                    Game.GameId, bet.RoundId, bet.PlayerId, bet.Id, win, credit.ErrorCode, credit.Error);
             }
         }
         catch (Exception ex)
         {
             bet.WinPending = true;
-            logger.LogCritical(ex, "Live crash payout failed: game={GameId} bet={BetId}", game.GameId, bet.Id);
+            logger.LogCritical(ex, "Live crash payout failed: game={GameId} bet={BetId}", Game.GameId, bet.Id);
         }
 
         await hub.Clients.Group(Group).SendAsync("CashedOut", PublicBet(bet));
@@ -314,7 +391,7 @@ public sealed class LiveCrashEngine(
     }
 
     private Task SendMyBet(LiveBet bet, decimal? balance) =>
-        hub.Clients.Group(PlayerGroup(game.GameId, bet.PlayerId)).SendAsync("MyBet", new { bet = MyBetDto(bet), balance });
+        hub.Clients.Group(PlayerGroup(Game.GameId, bet.PlayerId)).SendAsync("MyBet", new { bet = MyBetDto(bet), balance });
 
     private static object PublicBet(LiveBet b) => new
     {
@@ -328,7 +405,7 @@ public sealed class LiveCrashEngine(
 
     private object MyBetDto(LiveBet b) => new
     {
-        gameId      = game.GameId,
+        gameId      = Game.GameId,
         id          = b.Id,
         roundId     = b.RoundId,
         slot        = b.Slot,
@@ -338,6 +415,7 @@ public sealed class LiveCrashEngine(
         cashedOutAt = b.CashedOutAt,
         win         = b.Win,
         winPending  = b.WinPending,
+        freeBet     = b.FreeBet != null,
     };
 
     private static string Mask(string name) =>
@@ -369,5 +447,7 @@ public sealed class LiveCrashEngine(
         public decimal? CashedOutAt { get; set; }
         public decimal? Win { get; set; }
         public bool WinPending { get; set; }
+        /// <summary>Set for a promo free bet: nothing was debited, and the promotion settles it.</summary>
+        public PromoAward? FreeBet { get; init; }
     }
 }

@@ -35,9 +35,13 @@ public partial class WalletService(IWalletLedger ledger, IRGSAdapter rgs, ILogge
     public Task<decimal> GetBalanceAsync(PlayerSession player) =>
         rgs.GetBalanceAsync(player.PlayerId, player.Currency, player.GameId);
 
-    public Task<WalletResult> DebitAsync(GameDefinition game, PlayerSession player, string roundId, string transactionId, decimal amount)
+    /// <param name="extra">
+    /// An extra debit inside a round already opened with a valid stake (e.g. the DEFUSE tip): it may be below MinBet,
+    /// but must still be positive and within MaxBet.
+    /// </param>
+    public Task<WalletResult> DebitAsync(GameDefinition game, PlayerSession player, string roundId, string transactionId, decimal amount, bool extra = false)
     {
-        if (amount < game.MinBet || amount > game.MaxBet)
+        if (amount < (extra ? 0.01m : game.MinBet) || amount > game.MaxBet)
             return Task.FromResult(WalletResult.Fail(WalletErrorKind.BadRequest, "INVALID_AMOUNT",
                 FormattableString.Invariant($"Bet must be between {game.MinBet} and {game.MaxBet}.")));
 

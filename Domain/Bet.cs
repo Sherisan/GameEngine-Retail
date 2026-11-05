@@ -23,6 +23,13 @@ public class Bet
     /// </summary>
     public string? GameId { get; set; }
 
+    /// <summary>
+    /// Set when the bet is a promo free bet: no debit was made for it, and a win pays only what the promotion
+    /// allows (PromoEngine.SettleFreeBetAsync) instead of a normal credit.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Promotions.PromoAward? FreeBet { get; set; }
+
     // ── Interactive (Feeding Frenzy) mode ────────────────────────────────
     /// <summary>Extra multiplier earned by eating fish; added to the curve multiplier at cash-out.</summary>
     public decimal BoostMultiplier { get; set; }

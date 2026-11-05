@@ -12,12 +12,14 @@ public class AdminController : ControllerBase
     private readonly IRoundRepository _cache;
     private readonly IAsyncRoundRepository? _db;
     private readonly GameEngine _engine;
+    private readonly IGameConfigStore _gameConfig;
     private readonly string _apiKey;
 
-    public AdminController(IRoundRepository cache, GameEngine engine, IConfiguration config, IAsyncRoundRepository? db = null)
+    public AdminController(IRoundRepository cache, GameEngine engine, IGameConfigStore gameConfig, IConfiguration config, IAsyncRoundRepository? db = null)
     {
         _cache = cache;
         _engine = engine;
+        _gameConfig = gameConfig;
         _db = db;
         _apiKey = config["GamesApi:ApiKey"] ?? string.Empty;
     }
@@ -34,18 +36,26 @@ public class AdminController : ControllerBase
     public IActionResult GetLimits()
     {
         if (CheckApiKey() is { } err) return err;
-        var c = _engine.Config;
-        return Ok(new { minBet = c.MinBet, maxBet = c.MaxBet, maxWin = c.MaxWin });
+        var (minBet, maxBet, maxWin) = _engine.LimitsFor(null);
+        return Ok(new { minBet, maxBet, maxWin });
     }
 
+    /// <summary>Feeding Frenzy's limits — saved to its catalogue entry, the same as an edit in the Game Back Office.</summary>
     [HttpPut("limits")]
-    public IActionResult UpdateLimits([FromBody] UpdateLimitsRequest req)
+    public async Task<IActionResult> UpdateLimits([FromBody] UpdateLimitsRequest req)
     {
         if (CheckApiKey() is { } err) return err;
         if (req.MinBet <= 0 || req.MaxBet <= req.MinBet || req.MaxWin <= 0)
             return BadRequest("Invalid limits: MinBet > 0, MaxBet > MinBet, MaxWin > 0");
 
-        _engine.UpdateLimits(req.MinBet, req.MaxBet, req.MaxWin);
+        var current = _gameConfig.Games.FirstOrDefault(g => g.GameId == SessionTokenService.DefaultGameId);
+        if (current == null) return NotFound(new { error = $"Game \"{SessionTokenService.DefaultGameId}\" isn't in the catalogue." });
+        var game = GameCatalogue.Clone(current);
+        (game.MinBet, game.MaxBet, game.MaxWin) = (req.MinBet, req.MaxBet, req.MaxWin);
+        var games = _gameConfig.Games.Select(g => g == current ? game : g).ToList();
+        if (GameCatalogue.Problem(games) is { } problem) return BadRequest(problem);
+
+        await _gameConfig.SaveGameAsync(game, "games-api");
         return Ok(new { minBet = req.MinBet, maxBet = req.MaxBet, maxWin = req.MaxWin });
     }
 
