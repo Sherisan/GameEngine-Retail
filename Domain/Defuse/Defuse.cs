@@ -11,8 +11,8 @@ namespace Worldiator.Server.Domain.Defuse;
 /// A "rung" is the number of safe wires cleared, cut or revealed by the Bomb Squad Tip. Surviving to rung k has
 /// probability (6 − k) / 6, so the multiplier is RTP × 6 / (6 − k), floored to 2 dp: 1.16, 1.45, 1.94, 2.91, 5.82.
 ///
-/// The tip (once per round) reveals one safe wire and counts as a rung. With n live wires it costs bet / (n − 1),
-/// which is exactly what a free rung is worth, so RTP stays at 97% whether or not it's used, and whenever it's used.
+/// The tip (once per round) reveals one safe wire and counts as a rung. It costs the value of that rung divided by the
+/// RTP (TipCost), so the tip itself returns 97% whenever it is bought.
 ///
 /// Must match the frontend's src/game/math.ts and src/game/fair.ts exactly.
 /// </summary>
@@ -29,8 +29,13 @@ public static class DefuseRules
 
     public static decimal Payout(decimal bet, int rung) => Math.Round(bet * Multiplier(rung), 2, MidpointRounding.AwayFromZero);
 
-    /// <summary>Tip price at this rung, rounded up to the cent.</summary>
-    public static decimal TipCost(decimal bet, int rung) => Math.Ceiling(bet * 100m / (WireCount - rung - 1)) / 100m;
+    /// <summary>
+    /// Tip price at this rung, rounded up to the cent. The free rung is worth (m(k+1) − m(k)) × bet, because on a fair
+    /// ladder a position at rung k is worth its cash-out value; dividing by the RTP makes the tip itself return 97%.
+    /// 16.5%, 29.9%, 50.5%, 100%, 300% of the bet. (A flat bet / (live − 1) undercharges late in the round.)
+    /// </summary>
+    public static decimal TipCost(decimal bet, int rung) =>
+        Math.Ceiling(bet * (Multiplier(rung + 1) - Multiplier(rung)) / Rtp * 100m) / 100m;
 }
 
 /// <summary>

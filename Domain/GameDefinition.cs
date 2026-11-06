@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using Worldiator.Server.Domain.MarginCall;
 using Worldiator.Server.Domain.Blackjack;
 using Worldiator.Server.Domain.Defuse;
+using Worldiator.Server.Domain.Vault;
 
 namespace Worldiator.Server.Domain;
 
@@ -19,10 +20,12 @@ public enum GameType { Crash, Slot, Prediction, Scratch, Table }
 ///                freshly shuffled shoe with its own provably-fair seed (no Rng block).
 ///   Defuse     — DEFUSE through api/defuse: cut wires one at a time, cash out before the detonator. Fixed 97% ladder
 ///                (DefuseRules) and its own provably-fair seed per round (no Rng block).
+///   Vault      — VAULT CRACKER through api/vault: crack a 5-digit combination, 1-in-4 alarm per digit, cash out any time.
+///                Fixed 97% ladder (VaultRules) and its own provably-fair seed per round (no Rng block).
 ///   Custom     — has its own engine and RNG (Feeding Frenzy) or its own backend.
 /// </summary>
 [JsonConverter(typeof(JsonStringEnumConverter))]
-public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom, Blackjack, Defuse }
+public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom, Blackjack, Defuse, Vault }
 
 /// <summary>
 /// A game that can be launched through this API and use its shared wallet endpoints.
@@ -118,6 +121,11 @@ public class GameDefinition
                 if (Rng != null) Fail("Engine Defuse draws its own provably-fair detonator — remove the Rng block.");
                 if (MaxWin < MaxBet * DefuseRules.TopMultiplier)
                     Fail($"MaxWin {MaxWin} is below MaxBet × {DefuseRules.TopMultiplier} — a full defuse couldn't be paid.");
+                break;
+            case EngineKind.Vault:
+                if (Rng != null) Fail("Engine Vault draws its own provably-fair alarms — remove the Rng block.");
+                if (MaxWin < MaxBet * VaultRules.TopMultiplier)
+                    Fail($"MaxWin {MaxWin} is below MaxBet × {VaultRules.TopMultiplier} — opening the vault couldn't be paid.");
                 break;
         }
         if (Rng?.Model == RngModel.Wheel && Engine != EngineKind.Roulette)

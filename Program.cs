@@ -7,6 +7,7 @@ using System.Threading.RateLimiting;
 using Worldiator.Server.Application;
 using Worldiator.Server.Application.Blackjack;
 using Worldiator.Server.Application.Defuse;
+using Worldiator.Server.Application.Vault;
 using Worldiator.Server.Application.LiveCrash;
 using Worldiator.Server.Application.MarginCall;
 using Worldiator.Server.Application.Promotions;
@@ -230,6 +231,9 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<BlackjackService>(
 // Engine = Defuse games play through api/defuse (cut wires, cash out before the detonator).
 builder.Services.AddSingleton<DefuseService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DefuseService>());
+// Engine = Vault games play through api/vault (crack the combination, cash out before the alarm).
+builder.Services.AddSingleton<VaultService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<VaultService>());
 
 // ─── Margin Call (TradeX) — live trading crash game ─────────────────────────
 // Server-authoritative markets, rounds and settlement on /margincallhub. See MarginCallEngine.
