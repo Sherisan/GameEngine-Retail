@@ -3,6 +3,9 @@ using Worldiator.Server.Domain.MarginCall;
 using Worldiator.Server.Domain.Blackjack;
 using Worldiator.Server.Domain.Defuse;
 using Worldiator.Server.Domain.Vault;
+using Worldiator.Server.Domain.Dive;
+using Worldiator.Server.Domain.Fruit;
+using Worldiator.Server.Domain.Hive;
 
 namespace Worldiator.Server.Domain;
 
@@ -22,10 +25,17 @@ public enum GameType { Crash, Slot, Prediction, Scratch, Table }
 ///                (DefuseRules) and its own provably-fair seed per round (no Rng block).
 ///   Vault      — VAULT CRACKER through api/vault: crack a 5-digit combination, 1-in-4 alarm per digit, cash out any time.
 ///                Fixed 97% ladder (VaultRules) and its own provably-fair seed per round (no Rng block).
-///   Custom     — has its own engine and RNG (Feeding Frenzy) or its own backend.
+///   Dive       — DEEP DIVE through api/dive: eight depth zones, a shark in one cave of three per zone, surface any time.
+///                Fixed 97% ladder (DiveRules) and its own provably-fair seed per round (no Rng block).
+///   Fruit      — JUICE RUSH through api/fruit: slice fruit, each kind with its own bomb odds, cash out before a bomb.
+///                97% applied once per round, top prize ×1000 (FruitRules), its own provably-fair seed per round (no Rng block).
+///   Hive       — HIVE MIND through api/hive: open honeycomb cells whose clues count the bees next door, cash out before
+///                a sting. Each pick is priced at its exact odds given the clues, 97% applied once per round, top prize
+///                ×500 (HiveRules), its own provably-fair seed per round (no Rng block).
+///   Custom    — has its own engine and RNG (Feeding Frenzy) or its own backend.
 /// </summary>
 [JsonConverter(typeof(JsonStringEnumConverter))]
-public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom, Blackjack, Defuse, Vault }
+public enum EngineKind { Instant, LiveCrash, MarginCall, Roulette, Custom, Blackjack, Defuse, Vault, Dive, Fruit, Hive }
 
 /// <summary>
 /// A game that can be launched through this API and use its shared wallet endpoints.
@@ -126,6 +136,21 @@ public class GameDefinition
                 if (Rng != null) Fail("Engine Vault draws its own provably-fair alarms — remove the Rng block.");
                 if (MaxWin < MaxBet * VaultRules.TopMultiplier)
                     Fail($"MaxWin {MaxWin} is below MaxBet × {VaultRules.TopMultiplier} — opening the vault couldn't be paid.");
+                break;
+            case EngineKind.Dive:
+                if (Rng != null) Fail("Engine Dive draws its own provably-fair sharks — remove the Rng block.");
+                if (MaxWin < MaxBet * DiveRules.TopMultiplier)
+                    Fail($"MaxWin {MaxWin} is below MaxBet × {DiveRules.TopMultiplier} — reaching the abyss couldn't be paid.");
+                break;
+            case EngineKind.Fruit:
+                if (Rng != null) Fail("Engine Fruit rolls its own provably-fair bombs — remove the Rng block.");
+                if (MaxWin < MaxBet * FruitRules.MaxMultiplier)
+                    Fail($"MaxWin {MaxWin} is below MaxBet × {FruitRules.MaxMultiplier} — the top prize couldn't be paid.");
+                break;
+            case EngineKind.Hive:
+                if (Rng != null) Fail("Engine Hive hides its own provably-fair bees — remove the Rng block.");
+                if (MaxWin < MaxBet * HiveRules.MaxMultiplier)
+                    Fail($"MaxWin {MaxWin} is below MaxBet × {HiveRules.MaxMultiplier} — the top prize couldn't be paid.");
                 break;
         }
         if (Rng?.Model == RngModel.Wheel && Engine != EngineKind.Roulette)

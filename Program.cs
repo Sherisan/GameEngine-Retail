@@ -8,6 +8,9 @@ using Worldiator.Server.Application;
 using Worldiator.Server.Application.Blackjack;
 using Worldiator.Server.Application.Defuse;
 using Worldiator.Server.Application.Vault;
+using Worldiator.Server.Application.Dive;
+using Worldiator.Server.Application.Fruit;
+using Worldiator.Server.Application.Hive;
 using Worldiator.Server.Application.LiveCrash;
 using Worldiator.Server.Application.MarginCall;
 using Worldiator.Server.Application.Promotions;
@@ -234,6 +237,15 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<DefuseService>());
 // Engine = Vault games play through api/vault (crack the combination, cash out before the alarm).
 builder.Services.AddSingleton<VaultService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<VaultService>());
+// Engine = Dive games play through api/dive (pick a cave per zone, surface before the shark).
+builder.Services.AddSingleton<DiveService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DiveService>());
+// Engine = Fruit games play through api/fruit (slice fruit, cash out before a bomb).
+builder.Services.AddSingleton<FruitService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<FruitService>());
+// Engine = Hive games play through api/hive (open honeycomb cells, read the clues, cash out before a sting).
+builder.Services.AddSingleton<HiveService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<HiveService>());
 
 // ─── Margin Call (TradeX) — live trading crash game ─────────────────────────
 // Server-authoritative markets, rounds and settlement on /margincallhub. See MarginCallEngine.
