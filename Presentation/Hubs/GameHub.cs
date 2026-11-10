@@ -117,10 +117,14 @@ public class GameHub : Hub
     public async Task BombHit(int slot, int bombId)
     {
         if (slot < 0 || slot > 1) return;
-        var (playerId, _, _) = GetPlayerContext();
-        var (success, _) = _engine.BombHit(playerId, slot, bombId);
-        if (success)
-            await Clients.Caller.SendAsync("PlayerDied", new { slot });
+        var (playerId, _, currency) = GetPlayerContext();
+        var (success, winAmount, _) = await _engine.BombHitAsync(playerId, slot, bombId);
+        if (!success) return;
+        // The mine cashed the bet out: tell the player their fish is gone, then settle it like a cash-out.
+        await Clients.Caller.SendAsync("PlayerDied", new { slot, winAmount });
+        var balance = await _rgs.GetBalanceAsync(playerId, currency, GameId);
+        var roundId = _engine.GetBet(playerId, slot)?.RoundId ?? string.Empty;
+        await Clients.Caller.SendAsync("CashOutResult", new { slot, winAmount, balance, roundId, success = true });
     }
 
     public async Task GambleWinnings(int slot)

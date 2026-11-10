@@ -23,7 +23,8 @@ namespace Worldiator.Server.Infrastructure;
 /// </summary>
 public class EasyRNGService : IRNGService
 {
-    private const double HouseEdgePercent = 4.0;
+    // 95.5% from the curve; fish boosts (at most +0.5%, SpawnSchedule.MaxBoost) bring a player to at most 96%.
+    private const double HouseEdgePercent = 4.5;
     private const decimal MaxMultiplier = 10000m;
 
     private ProvablyFairCrashMultiplierGenerator? _current;

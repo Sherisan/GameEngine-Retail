@@ -31,10 +31,8 @@ public class Bet
     public Promotions.PromoAward? FreeBet { get; set; }
 
     // ── Interactive (Feeding Frenzy) mode ────────────────────────────────
-    /// <summary>Extra multiplier earned by eating fish; added to the curve multiplier at cash-out.</summary>
+    /// <summary>Payout boost earned by eating fish, as a fraction (0.005 = +0.5%); the payout is curve × (1 + boost).</summary>
     public decimal BoostMultiplier { get; set; }
-    /// <summary>True once the player's fish hit a mine — the bet can no longer cash out.</summary>
-    public bool IsDead { get; set; }
     /// <summary>Spawn ids already eaten by this bet (each fish is edible once).</summary>
     public HashSet<int> EatenFishIds { get; } = new();
 }

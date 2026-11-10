@@ -17,8 +17,12 @@ public record SpawnEvent(int Id, double TimeMs, bool IsBomb, int Tier, double Du
 /// </summary>
 public static class SpawnSchedule
 {
-    public static readonly double[] TierBoosts = { 0.02, 0.05, 0.12, 0.25 };
-    public const double MaxBoost = 2.0;
+    /// <summary>
+    /// Payout boost per eaten fish by tier, as a fraction (0.001 = +0.1%), capped at MaxBoost per bet. With the
+    /// crash curve at 95.5% RTP, the cap holds the game at 95.5–96.0% however many fish a player eats.
+    /// </summary>
+    public static readonly double[] TierBoosts = { 0.001, 0.002, 0.003, 0.005 };
+    public const double MaxBoost = 0.005;
 
     public static Dictionary<int, SpawnEvent> Generate(string serverSeedHash, string clientSeed, long nonce)
     {

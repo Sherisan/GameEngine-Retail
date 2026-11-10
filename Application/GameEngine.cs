@@ -175,10 +175,13 @@ public class GameEngine
             var elapsed = (DateTime.UtcNow - startTime).TotalMilliseconds;
             var current = MsToMultiplier(elapsed);
 
+            // The 100ms tick can land past the crash point on the last pass, so an auto cash-out only triggers for a
+            // target the round actually reached, and it pays exactly that target (not the overshot tick value).
+            var reached = Math.Min(current, (double)round.CrashMultiplier);
             var autoCashouts = new List<Bet>();
             lock (_lock)
             {
-                while (_autoCashoutQueue.Count > 0 && _autoCashoutQueue.Keys[0] <= current)
+                while (_autoCashoutQueue.Count > 0 && _autoCashoutQueue.Keys[0] <= reached)
                 {
                     autoCashouts.AddRange(_autoCashoutQueue.Values[0]);
                     _autoCashoutQueue.RemoveAt(0);
@@ -187,12 +190,13 @@ public class GameEngine
             foreach (var bet in autoCashouts)
             {
                 var pendingBet = bet;
-                _ = TryCashOutAsync(pendingBet, (decimal)current).ContinueWith(t =>
+                _ = TryCashOutAsync(pendingBet, pendingBet.AutoCashOutAt!.Value).ContinueWith(t =>
                 {
                     // A transient wallet failure (timeout, RGS hiccup) must not silently drop the
                     // auto cash-out — re-queue at the same threshold so the next tick retries it,
                     // instead of leaving the player's bet to ride to a possible crash unannounced.
-                    if (t.IsCompletedSuccessfully && !t.Result.success)
+                    // A bet a mine already cashed out is settled, so there is nothing to retry.
+                    if (t.IsCompletedSuccessfully && !t.Result.success && pendingBet.CashedOutAt == null)
                     {
                         lock (_lock) { AddToAutoCashoutQueue(pendingBet); }
                         _logger.LogWarning(
@@ -351,10 +355,10 @@ public class GameEngine
             bet = _currentRound.Bets.FirstOrDefault(b => b.PlayerId == playerId && b.SlotIndex == slot);
             if (bet == null) return (false, 0, "No active bet found");
             if (bet.CashedOutAt != null) return (false, 0, "Already cashed out");
-            if (bet.IsDead) return (false, 0, "Your fish is dead");
 
             var flyingStart = _currentRound.FlyingStartedAt ?? _currentRound.StartedAt;
             var elapsed = (DateTime.UtcNow - flyingStart).TotalMilliseconds;
+            if (PastCrash(_currentRound, elapsed)) return (false, 0, "Round has crashed");
             currentMultiplier = (decimal)Math.Round(MsToMultiplier(elapsed), 2);
         }
 
@@ -366,13 +370,11 @@ public class GameEngine
         lock (_lock)
         {
             if (bet.CashedOutAt != null) return (false, 0, "Already cashed out");
-            if (bet.IsDead) return (false, 0, "Your fish is dead");
-            // Boost earned by eating fish rides along with whatever curve multiplier
-            // triggered this cash-out (manual or auto) — reflected in both the stored
-            // CashedOutAt (what the client displays) and the payout.
-            var effective = multiplier + bet.BoostMultiplier;
-            bet.CashedOutAt = effective;
-            bet.WinAmount = Math.Round(bet.Amount * effective, 2);
+            // The fish boost is a percentage on top of whatever curve multiplier triggered this cash-out
+            // (manual, auto or mine). Both are floored, so rounding never pays above the curve's RTP.
+            var effective = multiplier * (1m + bet.BoostMultiplier);
+            bet.CashedOutAt = Math.Floor(effective * 100m) / 100m;
+            bet.WinAmount = Math.Floor(bet.Amount * effective * 100m) / 100m;
         }
 
         if (bet.FreeBet != null)
@@ -497,21 +499,28 @@ public class GameEngine
         }
     }
 
-    public (bool success, string error) BombHit(string playerId, int slot, int bombId)
+    /// <summary>
+    /// A mine ends the player's fish and cashes the bet out at the current multiplier: the player loses the climb,
+    /// not the stake. Cashing out at any point returns the curve's RTP on average, so mines never move the RTP.
+    /// </summary>
+    public async Task<(bool success, decimal winAmount, string error)> BombHitAsync(string playerId, int slot, int bombId)
     {
+        Bet bet;
+        decimal multiplier;
         lock (_lock)
         {
-            var (bet, elapsed, error) = GetLiveBetForInteraction(playerId, slot);
-            if (bet == null) return (false, error);
+            var (live, elapsed, error) = GetLiveBetForInteraction(playerId, slot);
+            if (live == null) return (false, 0, error);
 
-            if (_spawns == null || !_spawns.TryGetValue(bombId, out var ev)) return (false, "Unknown mine");
-            if (!ev.IsBomb) return (false, "Not a mine");
+            if (_spawns == null || !_spawns.TryGetValue(bombId, out var ev)) return (false, 0, "Unknown mine");
+            if (!ev.IsBomb) return (false, 0, "Not a mine");
             if (elapsed < ev.TimeMs - 1000 || elapsed > ev.TimeMs + ev.DurationMs + 2500)
-                return (false, "Mine not in play");
+                return (false, 0, "Mine not in play");
 
-            bet.IsDead = true;
-            return (true, string.Empty);
+            bet = live;
+            multiplier = (decimal)Math.Round(MsToMultiplier(elapsed), 2);
         }
+        return await TryCashOutAsync(bet, multiplier);
     }
 
     // Must be called under _lock.
@@ -522,10 +531,17 @@ public class GameEngine
         var bet = _currentRound.Bets.FirstOrDefault(b => b.PlayerId == playerId && b.SlotIndex == slot);
         if (bet == null) return (null, 0, "No active bet");
         if (bet.CashedOutAt != null) return (null, 0, "Already cashed out");
-        if (bet.IsDead) return (null, 0, "Your fish is dead");
         var flyingStart = _currentRound.FlyingStartedAt ?? _currentRound.StartedAt;
-        return (bet, (DateTime.UtcNow - flyingStart).TotalMilliseconds, string.Empty);
+        var elapsed = (DateTime.UtcNow - flyingStart).TotalMilliseconds;
+        if (PastCrash(_currentRound, elapsed)) return (null, 0, "Round has crashed");
+        return (bet, elapsed, string.Empty);
     }
+
+    /// <summary>
+    /// True once the curve has reached the crash point. The flying loop only notices on its next 100ms tick, and
+    /// nothing may pay out in that gap, or bets would win above the crash point.
+    /// </summary>
+    private static bool PastCrash(Round round, double elapsedMs) => elapsedMs >= MultiplierToMs(round.CrashMultiplier);
 
     /// <summary>
     /// Player tier index at a multiplier: 1=clownfish … 5=whale shark, from the game's evolution ladder set in
