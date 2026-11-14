@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Retail EGM Integration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+/* One reading column, same look as games-guide.html. Dark by default, light when the reader prefers it or prints. */
+:root {
+  --bg: #0c111b; --panel: #131a28; --panel-2: #0f1522; --edge: #233049;
+  --ink: #e6ebf5; --muted: #9aa6bd; --faint: #67748d;
+  --accent: #4db2ff; --in: #26c281; --out: #ff8c33; --stop: #f6465d; --warn: #f0b90b; --egm: #b69aff;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f8fb; --panel: #ffffff; --panel-2: #eef2f7; --edge: #d5dce8;
+    --ink: #121826; --muted: #44506a; --faint: #6b7790;
+    --accent: #0a6fc2; --in: #108a57; --out: #c45a00; --stop: #c7243a; --warn: #9a6a00; --egm: #6a43c9;
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f8fb; --panel: #ffffff; --panel-2: #eef2f7; --edge: #d5dce8;
+  --ink: #121826; --muted: #44506a; --faint: #6b7790;
+  --accent: #0a6fc2; --in: #108a57; --out: #c45a00; --stop: #c7243a; --warn: #9a6a00; --egm: #6a43c9;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 16px; line-height: 1.6; }
+main { max-width: 940px; margin: 0 auto; padding: 48px 16px 96px; display: flex; flex-direction: column; gap: 64px; }
+section { display: flex; flex-direction: column; gap: 16px; scroll-margin-top: 16px; }
+h1, h2, h3 { margin: 0; line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.3rem; letter-spacing: -0.02em; }
+h2 { font-size: 1.6rem; display: flex; align-items: baseline; gap: 12px; }
+h2 .num { font-family: var(--font-mono); font-size: 0.9rem; color: var(--faint); font-weight: 400; }
+h3 { font-size: 1.15rem; margin-top: 8px; }
+p, li { color: var(--muted); max-width: 76ch; }
+p { margin: 0; }
+ul, ol { margin: 0; padding-left: 1.3em; display: flex; flex-direction: column; gap: 6px; }
+strong { color: var(--ink); font-weight: 600; }
+a { color: var(--accent); }
+code { font-family: var(--font-mono); font-size: 0.86em; background: var(--panel); border: 1px solid var(--edge); border-radius: 4px; padding: 1px 5px; color: var(--ink); overflow-wrap: anywhere; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header { display: flex; flex-direction: column; gap: 14px; }
+.eyebrow { font-family: var(--font-mono); font-size: 0.78rem; color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em; }
+.lede { font-size: 1.1rem; }
+nav.toc { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin-top: 8px; }
+nav.toc a { text-decoration: none; color: var(--ink); background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 10px 12px; font-size: 0.92rem; display: flex; gap: 10px; }
+nav.toc a span { font-family: var(--font-mono); color: var(--faint); }
+nav.toc a:hover { border-color: var(--accent); }
+
+.panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 18px 20px; }
+.callout { border-left: 4px solid var(--warn); background: var(--panel); border-radius: 0 8px 8px 0; padding: 14px 18px; }
+.callout.key { border-left-color: var(--accent); }
+.callout.stop { border-left-color: var(--stop); }
+.callout p { color: var(--ink); }
+.table-wrap { overflow-x: auto; border: 1px solid var(--edge); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.93rem; background: var(--panel); }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--edge); vertical-align: top; }
+th { font-weight: 600; color: var(--ink); background: var(--panel-2); white-space: nowrap; }
+td { color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td code { white-space: nowrap; }
+.pill { font-family: var(--font-mono); font-size: 0.76rem; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.in { color: var(--in); } .pill.out { color: var(--out); } .pill.read { color: var(--accent); } .pill.egm { color: var(--egm); } .pill.stop { color: var(--stop); }
+.code { position: relative; }
+pre { margin: 0; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 10px; padding: 16px 18px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.83rem; line-height: 1.55; color: var(--ink); }
+pre .c { color: var(--faint); }
+pre .k { color: var(--accent); }
+.copy { position: absolute; top: 8px; right: 8px; font: 500 0.75rem var(--font-body); color: var(--muted); background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.copy:hover { color: var(--ink); border-color: var(--accent); }
+.endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-family: var(--font-mono); font-size: 0.95rem; }
+.endpoint .path { min-width: 0; overflow-wrap: anywhere; }
+.method { background: var(--accent); color: var(--bg); font-weight: 600; border-radius: 6px; padding: 2px 10px; }
+.host { font-family: var(--font-body); font-size: 0.8rem; font-weight: 600; border-radius: 999px; padding: 2px 10px; border: 1px solid currentColor; }
+.host.egm { color: var(--egm); } .host.us { color: var(--accent); }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 0.9rem; color: var(--muted); }
+.meta b { color: var(--ink); font-weight: 600; }
+.ex { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.ex-title { font-weight: 600; color: var(--ink); font-size: 0.95rem; margin-bottom: -6px; }
+.api-block { border: 1px solid var(--edge); border-top: 4px solid var(--c); border-radius: 12px; padding: 22px 20px; display: flex; flex-direction: column; gap: 16px; background: color-mix(in srgb, var(--panel) 60%, transparent); }
+.api-block.egm { --c: var(--egm); } .api-block.us { --c: var(--accent); }
+
+figure { margin: 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font-size: 0.85rem; color: var(--faint); margin-top: 8px; }
+svg text { font-family: var(--font-body); }
+svg .box { fill: var(--panel); stroke: var(--edge); stroke-width: 1.5; }
+svg .box-2 { fill: var(--panel-2); stroke: var(--edge); stroke-width: 1.2; }
+svg .box-egm { fill: var(--panel-2); stroke: var(--egm); stroke-width: 1.6; }
+svg .t { fill: var(--ink); font-size: 14px; font-weight: 600; }
+svg .s { fill: var(--muted); font-size: 12.5px; }
+svg .m { fill: var(--muted); font-size: 12px; font-family: var(--font-mono); }
+
+.checklist { list-style: none; padding: 0; }
+.checklist li { display: flex; gap: 10px; align-items: flex-start; }
+.checklist input { margin-top: 5px; accent-color: var(--accent); width: 16px; height: 16px; flex: none; }
+footer { color: var(--faint); font-size: 0.85rem; border-top: 1px solid var(--edge); padding-top: 20px; }
+
+@media (max-width: 560px) {
+  h1 { font-size: 1.8rem; } h2 { font-size: 1.35rem; }
+  main { gap: 48px; padding-top: 32px; }
+  th, td { padding: 8px 10px; }
+  .api-block { padding: 18px 14px; }
+}
+@media print {
+  :root { --bg: #fff; --panel: #fff; --panel-2: #f3f5f8; --edge: #ccd3df; --ink: #000; --muted: #222; --faint: #555;
+          --accent: #0a5fa8; --in: #0b7a4b; --out: #b35000; --stop: #b01f33; --warn: #8a5f00; --egm: #5b38b0; color-scheme: light; }
+  .copy, nav.toc { display: none; }
+  main { padding: 0; gap: 32px; }
+  pre, .table-wrap, figure { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <div class="eyebrow">Game Engine API · Retail</div>
+  <h1>Retail EGM integration</h1>
+  <p class="lede">This guide is for the team building the <strong>EGM side</strong>: the terminal software in or beside each cabinet, which handles the credit meter, the bill validator, AFT and the cash-out button.</p>
+  <div class="two-apis" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px">
+    <div class="panel"><span class="host egm">EGM API · you host it</span><p style="margin-top:8px">It holds the balance. The Game Engine API calls it to read the balance and to <strong>debit</strong> bets and <strong>credit</strong> wins.</p></div>
+    <div class="panel"><span class="host us">Game Engine API · we host it</span><p style="margin-top:8px">It runs the game. You call it when money arrives at or leaves the cabinet: notes, AFT and cash-outs.</p></div>
+  </div>
+  <nav class="toc" aria-label="Contents">
+    <a href="#how"><span>01</span>How it works</a>
+    <a href="#money"><span>02</span>How debit &amp; credit work</a>
+    <a href="#all"><span>03</span>All endpoints</a>
+    <a href="#egm-wallet"><span>04</span>EGM API: /wallet</a>
+    <a href="#session"><span>05</span>Game Engine: /session</a>
+    <a href="#terminal"><span>06</span>Game Engine: /terminal</a>
+    <a href="#session-flow"><span>07</span>One full session</a>
+    <a href="#test"><span>08</span>Test sequence</a>
+    <a href="#checklist"><span>09</span>Checklist</a>
+  </nav>
+</header>
+
+<!-- 1 -->
+<section id="how">
+  <h2><span class="num">01</span>How it works</h2>
+  <figure class="panel">
+    <svg viewBox="0 0 880 360" role="img" aria-labelledby="flow-title">
+      <title id="flow-title">The Game Engine API calls the EGM API's wallet endpoint for balance, debit, credit and rollback. The terminal calls the Game Engine API's terminal endpoint for Bill_Inserted, AFT_Deposit, Cashout and Balance. The browser plays the game against the Game Engine API.</title>
+      <defs>
+        <marker id="ah-egm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--egm)"/></marker>
+        <marker id="ah-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--accent)"/></marker>
+        <marker id="ah-in" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--in)"/></marker>
+      </defs>
+      <rect class="box" x="10" y="10" width="320" height="340" rx="12"/>
+      <text class="t" x="30" y="38">EGM side (you)</text>
+      <rect class="box-2" x="30" y="56" width="280" height="64" rx="8"/>
+      <text class="t" x="46" y="82">Browser on the cabinet</text>
+      <text class="m" x="46" y="104">&lt;GameUrl&gt;?egmid=EGM1</text>
+      <rect class="box-egm" x="30" y="140" width="280" height="96" rx="8"/>
+      <text class="t" x="46" y="166">EGM API · POST /wallet</text>
+      <text class="s" x="46" y="188">Holds the credit meter (the balance)</text>
+      <text class="m" x="46" y="214">meter: 250.00</text>
+      <rect class="box-2" x="30" y="256" width="280" height="78" rx="8"/>
+      <text class="t" x="46" y="282">Terminal</text>
+      <text class="s" x="46" y="304">Bill validator · AFT · cash-out button</text>
+
+      <rect class="box" x="560" y="10" width="310" height="340" rx="12"/>
+      <text class="t" x="580" y="38">Game Engine API (us)</text>
+      <rect class="box-2" x="580" y="56" width="270" height="64" rx="8"/>
+      <text class="t" x="596" y="82">Game rounds</text>
+      <text class="s" x="596" y="104">Decides every result</text>
+      <rect class="box-2" x="580" y="140" width="270" height="96" rx="8"/>
+      <text class="t" x="596" y="166">Wallet adapter</text>
+      <text class="s" x="596" y="188">No balance of its own: asks</text>
+      <text class="s" x="596" y="206">your EGM API every time</text>
+      <rect class="box-2" x="580" y="256" width="270" height="78" rx="8"/>
+      <text class="t" x="596" y="282">POST /api/retail/terminal</text>
+      <text class="s" x="596" y="304">Updates the game on screen</text>
+
+      <path d="M310,82 L578,82" style="stroke: var(--accent)" stroke-width="2" fill="none" marker-end="url(#ah-acc)" marker-start="url(#ah-acc)"/>
+      <text x="340" y="74" style="fill: var(--accent); font-size: 12.5px; font-weight: 600">plays the game · live balance</text>
+
+      <path d="M578,176 L312,176" style="stroke: var(--egm)" stroke-width="2" fill="none" marker-end="url(#ah-egm)"/>
+      <text x="340" y="168" style="fill: var(--egm); font-size: 12.5px; font-weight: 600">Balance · Debit · Credit · Rollback</text>
+      <path d="M312,206 L578,206" style="stroke: var(--egm)" stroke-width="2" stroke-dasharray="5 4" fill="none" marker-end="url(#ah-egm)"/>
+      <text x="340" y="226" style="fill: var(--egm); font-size: 12.5px">answers { balance }</text>
+
+      <path d="M310,296 L578,296" style="stroke: var(--in)" stroke-width="2" fill="none" marker-end="url(#ah-in)"/>
+      <text x="340" y="288" style="fill: var(--in); font-size: 12.5px; font-weight: 600">Bill_Inserted · AFT_Deposit · Cashout</text>
+    </svg>
+    <figcaption>Purple: we call you, on every balance read, bet and win. Green: you call us when money arrives or leaves at the cabinet. Blue: the game itself.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Your meter is the balance.</strong> The Game Engine API keeps no balance of its own. It asks your EGM API every time.</li>
+    <li><strong>Bets and wins arrive as calls to your EGM API.</strong> You apply them to the meter and return the new balance.</li>
+    <li><strong>Notes, AFT and cash-outs are reported to us.</strong> That way the game on the cabinet's screen updates straight away. For a cash-out, we also confirm that no bet is still in play.</li>
+  </ul>
+</section>
+
+<!-- 2 -->
+<section id="money">
+  <h2><span class="num">02</span>How debit and credit work</h2>
+  <p>There is <strong>one</strong> endpoint on your side. Every call carries the EGM id, a <code>debit</code> and a <code>credit</code>. You apply both to the meter and return the balance afterwards.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What happens in the game</th><th>Call to your EGM API</th><th>Meter</th></tr></thead>
+      <tbody>
+        <tr><td>The game opens, reconnects or shows the balance</td><td><code>debit: 0, credit: 0</code><br><span class="pill read">Balance</span></td><td>No change. You return the balance.</td></tr>
+        <tr><td>The player places a bet</td><td><code>debit: stake, credit: 0</code><br><span class="pill out">Debit</span></td><td>− stake. If the meter is too low, answer <code>402 INSUFFICIENT_FUNDS</code>.</td></tr>
+        <tr><td>The player wins (cashes out in time)</td><td><code>debit: 0, credit: win</code><br><span class="pill in">Credit</span></td><td>+ win. <strong>The win includes the stake</strong> (a stake of 10 cashed out at 1.10x gives a credit of 11).</td></tr>
+        <tr><td>The player loses (the round crashes first)</td><td><strong>No call</strong></td><td>The stake is already gone.</td></tr>
+        <tr><td>A bet is refunded (the round closed while it was being placed)</td><td><code>debit: 0, credit: stake</code><br><span class="pill in">Rollback</span> with <code>relatedTransactionId</code></td><td>+ stake. If you never booked that bet, refund nothing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout key">
+    <p><strong>The rules for every call:</strong></p>
+    <ol style="margin-top:8px">
+      <li><strong><code>transactionId</code> is an idempotency key.</strong> We send the same id again when a call times out. If you have already booked it, don't book it again: answer 200 with the current balance and <code>duplicate: true</code>. If the id comes back with a <em>different</em> debit or credit, answer <code>409 REFERENCE_CONFLICT</code>.</li>
+      <li><strong>Apply the call atomically.</strong> Check the meter, change it and record the transaction as one operation. Two bets can arrive at the same moment, one for each betting slot.</li>
+      <li><strong>Answer within 5 seconds.</strong> After a timeout we retry up to 3 times with the same id. If a bet still fails, it isn't placed. If a win still fails, the player is told to try again and we log it for reconciliation.</li>
+      <li><strong>Never pay out from a game call.</strong> Debits and credits only move the meter. Money leaves the cabinet only through a cash-out.</li>
+    </ol>
+  </div>
+  <p>The ids we send look like <code>BET_&lt;32 hex&gt;</code>, <code>WIN_&lt;32 hex&gt;</code> and <code>ROLLBACK_BET_&lt;32 hex&gt;</code>. A bet and its win share the same hex part, so you can match them. Treat them as opaque strings of up to 100 characters.</p>
+</section>
+
+<!-- 3 -->
+<section id="all">
+  <h2><span class="num">03</span>All endpoints</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Hosted by</th><th>Called by</th><th>Endpoint</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#egm-wallet">A</a></td><td><span class="host egm">EGM API (you)</span></td><td>Game Engine API</td><td><code>POST {EGM API}/wallet</code></td><td>Balance, debit (bet), credit (win), rollback (refund)</td></tr>
+        <tr><td><a href="#session">B</a></td><td><span class="host us">Game Engine API</span></td><td>The game, in the cabinet's browser</td><td><code>POST /api/retail/session</code></td><td>Turns <code>?egmid=EGM1</code> into a game session</td></tr>
+        <tr><td><a href="#terminal">C</a></td><td><span class="host us">Game Engine API</span></td><td>Terminal</td><td><code>POST /api/retail/terminal</code></td><td><code>Bill_Inserted</code>, <code>AFT_Deposit</code>, <code>Cashout</code>, <code>Balance</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout"><p>All bodies are JSON. Amounts are <strong>currency units with up to 2 decimals</strong> (<code>250.50</code> means R250.50), <strong>not cents</strong>. Field names are camelCase.</p></div>
+</section>
+
+<!-- 4: EGM wallet -->
+<section id="egm-wallet" class="api-block egm">
+  <h2><span class="num">04 · A</span>EGM API: wallet (you build this)</h2>
+  <div class="panel endpoint"><span class="method">POST</span><span class="path">{EGM API}/wallet</span><span class="host egm">hosted by you</span></div>
+  <div class="meta"><span><b>Called by:</b> the Game Engine API</span><span><b>Auth:</b> header <code>X-Api-Key: &lt;key you issue us&gt;</code>; refuse anything else with 401</span><span><b>Path:</b> <code>wallet</code> by default; tell us if yours is different</span></div>
+
+  <h3>Request</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>egmId</code></td><td>string</td><td>The cabinet, e.g. <code>"EGM1"</code>.</td></tr>
+      <tr><td><code>debit</code></td><td>number</td><td>The amount to take off the meter. <code>0</code> if none.</td></tr>
+      <tr><td><code>credit</code></td><td>number</td><td>The amount to add to the meter. <code>0</code> if none.</td></tr>
+      <tr><td><code>type</code></td><td>string</td><td><code>"Balance"</code>, <code>"Debit"</code>, <code>"Credit"</code> or <code>"Rollback"</code>. This labels the call; <code>debit</code> and <code>credit</code> carry the money.</td></tr>
+      <tr><td><code>transactionId</code></td><td>string | null</td><td>The idempotency key. <code>null</code> for Balance.</td></tr>
+      <tr><td><code>roundId</code></td><td>string | null</td><td>The game round. <code>null</code> for Balance.</td></tr>
+      <tr><td><code>gameId</code></td><td>string | null</td><td>e.g. <code>"feeding-frenzy"</code>.</td></tr>
+      <tr><td><code>currency</code></td><td>string</td><td>e.g. <code>"ZAR"</code>.</td></tr>
+      <tr><td><code>relatedTransactionId</code></td><td>string | null</td><td>For Rollback, the <code>transactionId</code> of the bet being refunded. Otherwise <code>null</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Response, HTTP 200</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>egmId</code></td><td>string</td><td>Echo of the request.</td></tr>
+      <tr><td><code>balance</code></td><td>number</td><td><strong>Required.</strong> The meter after this call.</td></tr>
+      <tr><td><code>transactionId</code></td><td>string | null</td><td>Echo of the request.</td></tr>
+      <tr><td><code>duplicate</code></td><td>boolean</td><td><code>true</code> when this <code>transactionId</code> had already been booked and nothing changed now.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Errors</h3>
+  <p>Return a non-200 status with <code>{ "error": "&lt;CODE&gt;", "message": "&lt;text&gt;" }</code>.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>HTTP</th><th>error</th><th>When</th><th>What we do</th></tr></thead>
+    <tbody>
+      <tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>The <code>X-Api-Key</code> is wrong</td><td>Fail the call.</td></tr>
+      <tr><td>402</td><td><code>INSUFFICIENT_FUNDS</code></td><td>The debit is more than the meter</td><td>The bet is refused and the player sees "Insufficient credits".</td></tr>
+      <tr><td>404</td><td><code>EGM_NOT_FOUND</code></td><td>Unknown <code>egmId</code></td><td>Fail the call.</td></tr>
+      <tr><td>409</td><td><code>REFERENCE_CONFLICT</code></td><td>Id reused with different amounts</td><td>Fail the call and log it.</td></tr>
+      <tr><td>423</td><td><code>EGM_LOCKED</code></td><td>A debit arrived during a cash-out</td><td>The bet is refused.</td></tr>
+      <tr><td>5xx, timeout</td><td>—</td><td>Your side failed</td><td><strong>Retry with the same <code>transactionId</code>.</strong></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Examples</h3>
+  <div class="ex-title">Balance: the game opens, or the balance is shown</div>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "debit": 0,
+  "credit": 0,
+  "type": "Balance",
+  "transactionId": null,
+  "roundId": null,
+  "gameId": null,
+  "currency": "ZAR",
+  "relatedTransactionId": null
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "balance": 250.00,
+  "transactionId": null,
+  "duplicate": false
+}</pre></div>
+  </div>
+
+  <div class="ex-title">Debit: the player bets R10</div>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "debit": 10,
+  "credit": 0,
+  "type": "Debit",
+  "transactionId": "BET_e5085f8a4d304082a0330e5e9237eee1",
+  "roundId": "499c1a325f3f49bc8f83e6fc9aa269c7",
+  "gameId": "feeding-frenzy",
+  "currency": "ZAR",
+  "relatedTransactionId": null
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "balance": 240.00,
+  "transactionId": "BET_e5085f8a4d304082a0330e5e9237eee1",
+  "duplicate": false
+}
+
+<span class="c">// 402: meter too low</span>
+{
+  "error": "INSUFFICIENT_FUNDS",
+  "message": "Insufficient credits",
+  "balance": 0.00
+}</pre></div>
+  </div>
+
+  <div class="ex-title">Credit: the R10 bet cashed out at 1.10x, so the win is R11</div>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "debit": 0,
+  "credit": 11,
+  "type": "Credit",
+  "transactionId": "WIN_e5085f8a4d304082a0330e5e9237eee1",
+  "roundId": "499c1a325f3f49bc8f83e6fc9aa269c7",
+  "gameId": "feeding-frenzy",
+  "currency": "ZAR",
+  "relatedTransactionId": null
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "balance": 251.00,
+  "transactionId": "WIN_e5085f8a4d304082a0330e5e9237eee1",
+  "duplicate": false
+}</pre></div>
+  </div>
+
+  <div class="ex-title">Rollback: the bet is refunded</div>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "debit": 0,
+  "credit": 10,
+  "type": "Rollback",
+  "transactionId": "ROLLBACK_BET_e5085f8a4d304082a0330e5e9237eee1",
+  "roundId": "499c1a325f3f49bc8f83e6fc9aa269c7",
+  "gameId": "feeding-frenzy",
+  "currency": "ZAR",
+  "relatedTransactionId": "BET_e5085f8a4d304082a0330e5e9237eee1"
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200: if the bet was never booked,
+// refund nothing and still answer 200</span>
+{
+  "egmId": "EGM1",
+  "balance": 250.00,
+  "transactionId": "ROLLBACK_BET_e5085f8a…",
+  "duplicate": false
+}</pre></div>
+  </div>
+
+  <div class="ex-title">Repeat: the R10 debit arrives again after a timeout</div>
+  <div class="code"><pre><span class="c">// 200, nothing booked</span>
+{ "egmId": "EGM1", "balance": 240.00, "transactionId": "BET_e5085f8a4d304082a0330e5e9237eee1", "duplicate": true }</pre></div>
+</section>
+
+<!-- 5: session -->
+<section id="session" class="api-block us">
+  <h2><span class="num">05 · B</span>Game Engine API: session</h2>
+  <div class="panel endpoint"><span class="method">POST</span><span class="path">/api/retail/session</span><span class="host us">hosted by us</span></div>
+  <div class="meta"><span><b>Called by:</b> the game, when the cabinet's browser opens <code>&lt;GameUrl&gt;?egmid=EGM1</code></span><span><b>Auth:</b> the EGM must be registered with us (and can be locked to an IP address)</span></div>
+  <p>You don't call this endpoint. It is listed so you can see the whole flow. To launch the game, open the URL in kiosk mode and keep it open all day.</p>
+  <div class="two-tables" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">
+    <div class="table-wrap"><table>
+      <thead><tr><th>Request field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>egmId</code></td><td>string</td><td>From <code>?egmid=</code>. Required.</td></tr>
+        <tr><td><code>gameId</code></td><td>string</td><td>Optional. Defaults to <code>"feeding-frenzy"</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Response field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>token</code></td><td>string</td><td>The game session (JWT).</td></tr>
+        <tr><td><code>egmId</code>, <code>name</code></td><td>string</td><td>The registered EGM.</td></tr>
+        <tr><td><code>currency</code></td><td>string</td><td>e.g. <code>"ZAR"</code>.</td></tr>
+        <tr><td><code>balance</code></td><td>number | null</td><td>Read from your EGM API. <code>null</code> if it didn't answer.</td></tr>
+        <tr><td><code>gameId</code></td><td>string</td><td>The game being played.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{ "egmId": "EGM1" }</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "token": "eyJhbGciOiJIUzI1NiIs…",
+  "egmId": "EGM1",
+  "name": "EGM 1",
+  "currency": "ZAR",
+  "balance": 250.00,
+  "gameId": "feeding-frenzy"
+}</pre></div>
+  </div>
+  <p><strong>Errors:</strong> <code>404 EGM_NOT_FOUND</code> (not registered with us), <code>403 EGM_ADDRESS_NOT_ALLOWED</code> (opened from an IP address the EGM isn't registered for), <code>404 GAME_NOT_FOUND</code>.</p>
+</section>
+
+<!-- 6: terminal -->
+<section id="terminal" class="api-block us">
+  <h2><span class="num">06 · C</span>Game Engine API: terminal events (you call this)</h2>
+  <div class="panel endpoint"><span class="method">POST</span><span class="path">/api/retail/terminal</span><span class="host us">hosted by us</span></div>
+  <div class="meta"><span><b>Called by:</b> your terminal</span><span><b>Auth:</b> header <code>X-Terminal-Key: &lt;key we issue you&gt;</code></span></div>
+
+  <h3>Request</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>egmId</code></td><td>string</td><td>yes</td><td>The cabinet.</td></tr>
+      <tr><td><code>event</code></td><td>string</td><td>yes</td><td><code>"Bill_Inserted"</code>, <code>"AFT_Deposit"</code>, <code>"Cashout"</code> or <code>"Balance"</code>.</td></tr>
+      <tr><td><code>amount</code></td><td>number</td><td>Bill / AFT</td><td>The amount that arrived, more than 0.</td></tr>
+      <tr><td><code>transactionId</code></td><td>string</td><td>all except Balance</td><td>Your id for the event, up to 100 characters. Used in our logs for reconciliation.</td></tr>
+      <tr><td><code>balance</code></td><td>number</td><td>optional (Bill / AFT)</td><td>Your meter <strong>after</strong> the deposit. If you send it, we show it without calling you back. If you leave it out, we read it from your EGM API.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Response, HTTP 200</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>egmId</code>, <code>event</code>, <code>transactionId</code></td><td>string</td><td>Echo of the request.</td></tr>
+      <tr><td><code>amount</code></td><td>number</td><td>The deposit for Bill / AFT. For <strong>Cashout: the game's balance, the amount to pay out</strong>. <code>0</code> for Balance.</td></tr>
+      <tr><td><code>balance</code></td><td>number</td><td>The balance as the game sees it.</td></tr>
+      <tr><td><code>currency</code></td><td>string</td><td>e.g. <code>"ZAR"</code>.</td></tr>
+      <tr><td><code>timestamp</code></td><td>string</td><td>The time we handled it (UTC, ISO 8601).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Errors</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>HTTP</th><th>error</th><th>What you do</th></tr></thead>
+    <tbody>
+      <tr><td>400</td><td><code>INVALID_EVENT</code> <code>INVALID_AMOUNT</code> <code>INVALID_REFERENCE</code></td><td>A bug in the request. Log it and raise an alert.</td></tr>
+      <tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>Wrong or missing <code>X-Terminal-Key</code>.</td></tr>
+      <tr><td>404</td><td><code>EGM_NOT_FOUND</code></td><td>The EGM isn't registered with us.</td></tr>
+      <tr><td>409</td><td><code>ROUND_IN_PROGRESS</code></td><td>Cashout only. A bet is in play. Retry every 1–2 seconds.</td></tr>
+      <tr><td>502</td><td><code>EGM_WALLET_UNAVAILABLE</code></td><td>We couldn't read your EGM API. Check that it's up, then retry.</td></tr>
+      <tr><td>5xx, timeout</td><td>—</td><td>Retry.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Bill_Inserted</h3>
+  <p>Send this <strong>after</strong> the note is stacked <strong>and</strong> you have added it to your meter. The game shows the new balance straight away with a "Credits added" message. If this call fails, the money is still safe on your meter; the game picks the balance up on its next read.</p>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "event": "Bill_Inserted",
+  "amount": 200,
+  "transactionId": "EGM1-BILL-000123",
+  "balance": 200.00
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "event": "Bill_Inserted",
+  "transactionId": "EGM1-BILL-000123",
+  "amount": 200.00,
+  "balance": 200.00,
+  "currency": "ZAR",
+  "timestamp": "2026-11-10T14:35:05.0894700Z"
+}</pre></div>
+  </div>
+
+  <h3>AFT_Deposit</h3>
+  <p>The same as Bill_Inserted, sent <strong>after</strong> the AFT transfer has completed and the funds are on your meter. Here no <code>balance</code> is sent, so we read it from your EGM API.</p>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "event": "AFT_Deposit",
+  "amount": 50,
+  "transactionId": "EGM1-AFT-7F3A91"
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "event": "AFT_Deposit",
+  "transactionId": "EGM1-AFT-7F3A91",
+  "amount": 50,
+  "balance": 250.00,
+  "currency": "ZAR",
+  "timestamp": "2026-11-10T14:35:05.1187704Z"
+}</pre></div>
+  </div>
+
+  <h3>Cashout</h3>
+  <figure class="panel">
+    <svg viewBox="0 0 880 250" role="img" aria-labelledby="co-title">
+      <title id="co-title">Cash-out procedure: lock debits on the meter, call Cashout, retry on 409 while a round is in progress, and on 200 pay out the meter, zero it and unlock.</title>
+      <defs>
+        <marker id="c-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--muted)"/></marker>
+        <marker id="c-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--warn)"/></marker>
+        <marker id="c-in" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--in)"/></marker>
+      </defs>
+      <rect class="box" x="10" y="40" width="190" height="86" rx="10"/>
+      <text class="t" x="26" y="68">1 · Lock debits</text>
+      <text class="s" x="26" y="90">Debit → 423 EGM_LOCKED</text>
+      <text class="s" x="26" y="110">Credit / Rollback still OK</text>
+      <path d="M200,83 L248,83" style="stroke: var(--muted)" stroke-width="2" fill="none" marker-end="url(#c-ah)"/>
+      <rect class="box" x="250" y="40" width="190" height="86" rx="10"/>
+      <text class="t" x="266" y="68">2 · POST Cashout</text>
+      <text class="s" x="266" y="90">/api/retail/terminal</text>
+      <path d="M440,70 L558,70" style="stroke: var(--in)" stroke-width="2" fill="none" marker-end="url(#c-in)"/>
+      <text x="470" y="62" style="fill: var(--in); font-size: 12.5px; font-weight: 600">200 · amount</text>
+      <rect class="box" x="560" y="30" width="310" height="96" rx="10"/>
+      <text class="t" x="576" y="58">4–5 · Pay your meter, set it to 0, unlock</text>
+      <text class="s" x="576" y="80">Ticket, AFT off or hopper.</text>
+      <text class="s" x="576" y="100">The meter should equal amount.</text>
+      <rect class="box" x="250" y="170" width="300" height="66" rx="10"/>
+      <text class="t" x="266" y="198">3 · 409 ROUND_IN_PROGRESS</text>
+      <text class="s" x="266" y="220">"Finishing game…", wait 1–2 s, retry</text>
+      <path d="M380,126 L380,168" style="stroke: var(--warn)" stroke-width="2" fill="none" marker-end="url(#c-warn)"/>
+      <path d="M300,170 L300,128" style="stroke: var(--warn)" stroke-width="1.6" stroke-dasharray="5 4" fill="none" marker-end="url(#c-warn)"/>
+      <text x="390" y="152" style="fill: var(--warn); font-size: 12.5px; font-weight: 600">409</text>
+      <text x="262" y="152" style="fill: var(--warn); font-size: 12.5px">retry</text>
+    </svg>
+    <figcaption>A Cashout changes nothing on our side, so repeating it after a timeout is always safe.</figcaption>
+  </figure>
+  <ol>
+    <li><strong>Lock the meter against debits.</strong> Until step 5, answer any Debit to your EGM API with <code>423 EGM_LOCKED</code>. <strong>Keep accepting Credit and Rollback</strong>, because a bet that is still riding must be able to pay out.</li>
+    <li><strong>Call Cashout.</strong></li>
+    <li><strong>On <code>409 ROUND_IN_PROGRESS</code>,</strong> a bet is still in play. Show "Finishing game…" and repeat step 2 every 1–2 seconds.</li>
+    <li><strong>On 200,</strong> <code>amount</code> is the game's balance. The game now shows R0.00.</li>
+    <li><strong>Pay out your meter</strong>, set it to 0, record the payout and unlock. Your meter and <code>amount</code> should match. If they don't, pay your meter (it is the balance) and log the difference for us.</li>
+  </ol>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{
+  "egmId": "EGM1",
+  "event": "Cashout",
+  "transactionId": "EGM1-CASHOUT-000045"
+}
+
+<span class="c">// 409 while a bet is riding</span>
+{
+  "error": "ROUND_IN_PROGRESS",
+  "message": "A bet is in play on this EGM — retry the cash-out when the round ends."
+}</pre></div>
+    <div class="code"><pre><span class="c">// 200 once the round has ended</span>
+{
+  "egmId": "EGM1",
+  "event": "Cashout",
+  "transactionId": "EGM1-CASHOUT-000045",
+  "amount": 251.00,      <span class="c">← pay this</span>
+  "balance": 251.00,
+  "currency": "ZAR",
+  "timestamp": "2026-11-10T14:35:31.8360201Z"
+}</pre></div>
+  </div>
+
+  <h3>Balance</h3>
+  <p>This returns the balance as the game sees it. It always matches your meter, because we read it from your EGM API. Use it as a health check of both directions.</p>
+  <div class="ex">
+    <div class="code"><button class="copy" type="button">Copy</button><pre><span class="c">// request</span>
+{ "egmId": "EGM1", "event": "Balance" }</pre></div>
+    <div class="code"><pre><span class="c">// 200</span>
+{
+  "egmId": "EGM1",
+  "event": "Balance",
+  "transactionId": null,
+  "amount": 0,
+  "balance": 0.00,
+  "currency": "ZAR",
+  "timestamp": "2026-11-10T14:35:33.5478834Z"
+}</pre></div>
+  </div>
+</section>
+
+<!-- 7 -->
+<section id="session-flow">
+  <h2><span class="num">07</span>One full session</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Who calls</th><th>Call</th><th>Meter</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Game → us</td><td><code>/api/retail/session</code> <code>{ egmId: "EGM1" }</code></td><td></td></tr>
+      <tr><td>2</td><td><span class="pill egm">us → you</span></td><td><code>/wallet</code> Balance</td><td>0.00</td></tr>
+      <tr><td>3</td><td>You</td><td>A R200 note is stacked; you add it to the meter</td><td>200.00</td></tr>
+      <tr><td>4</td><td><span class="pill in">you → us</span></td><td><code>/terminal</code> Bill_Inserted 200, balance 200</td><td>200.00, shown in the game</td></tr>
+      <tr><td>5</td><td><span class="pill egm">us → you</span></td><td><code>/wallet</code> Debit 10 (<code>BET_…</code>)</td><td>190.00</td></tr>
+      <tr><td>6</td><td><span class="pill in">you → us</span></td><td><code>/terminal</code> Cashout → <strong>409</strong> ROUND_IN_PROGRESS</td><td>190.00 (debits locked)</td></tr>
+      <tr><td>7</td><td><span class="pill egm">us → you</span></td><td><code>/wallet</code> Credit 11 (<code>WIN_…</code>), allowed while locked</td><td>201.00</td></tr>
+      <tr><td>8</td><td><span class="pill in">you → us</span></td><td><code>/terminal</code> Cashout → <strong>200</strong>, amount 201</td><td>201.00</td></tr>
+      <tr><td>9</td><td>You</td><td>Pay R201.00, set the meter to 0, unlock</td><td>0.00</td></tr>
+      <tr><td>10</td><td><span class="pill egm">us → you</span></td><td><code>/wallet</code> Debit 10 on the next bet → <strong>402</strong> INSUFFICIENT_FUNDS</td><td>0.00</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- 8 -->
+<section id="test">
+  <h2><span class="num">08</span>Test sequence</h2>
+  <p>Against our staging API, with your EGM API reachable from it:</p>
+  <div class="code"><button class="copy" type="button">Copy</button><pre><span class="k">API</span>=https://&lt;retail-api-host&gt;; <span class="k">KEY</span>='&lt;terminal key&gt;'
+call() { curl -s -X POST "$API/api/retail/terminal" -H "Content-Type: application/json" -H "X-Terminal-Key: $KEY" -d "$1"; echo; }
+
+call '{"egmId":"EGM1","event":"Balance"}'                                                    <span class="c"># proves we can read your EGM API</span>
+call '{"egmId":"EGM1","event":"Bill_Inserted","amount":100,"transactionId":"T-BILL-1","balance":100}'
+call '{"egmId":"EGM1","event":"Cashout","transactionId":"T-CO-1"}'                           <span class="c"># amount = your meter</span></pre></div>
+  <p>Then, with the game open at <code>&lt;GameUrl&gt;?egmid=EGM1</code>:</p>
+  <ol>
+    <li>Insert a note. The game's balance updates within a second.</li>
+    <li>Bet R10. Your EGM API receives a Debit of 10 and the meter drops by 10.</li>
+    <li>Cash out in the game before the crash. Your EGM API receives a Credit that includes the stake.</li>
+    <li>Press cash out on the cabinet while a bet is riding. You get <code>409 ROUND_IN_PROGRESS</code>, then 200 once the round ends.</li>
+    <li>Make your EGM API time out once on a Debit. You receive the same <code>transactionId</code> again, and the meter must only drop once.</li>
+  </ol>
+</section>
+
+<!-- 9 -->
+<section id="checklist">
+  <h2><span class="num">09</span>Checklist</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" aria-label="done"><span>The EGM API's <code>/wallet</code> endpoint is live, reachable from our API, and checks <code>X-Api-Key</code>.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>Debit and credit are applied atomically and return the balance after the call.</span></li>
+    <li><input type="checkbox" aria-label="done"><span><code>transactionId</code> is idempotent: a repeat returns 200 with <code>duplicate: true</code> and changes nothing.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>A debit larger than the meter answers <code>402 INSUFFICIENT_FUNDS</code>.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>A rollback for an unknown bet refunds nothing and answers 200.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>The endpoint answers within 5 seconds.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>The cabinet's browser opens <code>&lt;GameUrl&gt;?egmid=&lt;id&gt;</code>, and each EGM id is registered with us.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>Bill_Inserted and AFT_Deposit are sent after the meter is updated, ideally with <code>balance</code>.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>Cash-out locks debits, retries on 409, pays the meter, and then unlocks.</span></li>
+    <li><input type="checkbox" aria-label="done"><span>Amounts are in currency units (not cents), with at most 2 decimal places.</span></li>
+  </ul>
+</section>
+
+<footer>Game Engine API · Retail EGM integration · The source for this page is <code>docs/RETAIL-TERMINAL-INTEGRATION.md</code>.</footer>
+
+</main>
+<script>
+// Copy buttons: copy the code block's text without the button label.
+document.querySelectorAll('.copy').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const text = btn.parentElement.querySelector('pre').innerText;
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = 'Copied';
+    } catch {
+      btn.textContent = 'Select & copy';
+    }
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+  });
+});
+</script>
+</body>
+</html>

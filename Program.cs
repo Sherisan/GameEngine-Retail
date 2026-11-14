@@ -14,6 +14,8 @@ using Worldiator.Server.Application.Hive;
 using Worldiator.Server.Application.LiveCrash;
 using Worldiator.Server.Application.MarginCall;
 using Worldiator.Server.Application.Promotions;
+using Worldiator.Server.Application.Retail;
+using Worldiator.Server.Domain.Retail;
 using Worldiator.Server.Background;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Domain;
@@ -149,6 +151,12 @@ switch (rgsProvider)
     case "Operator3":
         AddOperatorWallet<Operator3RGSAdapter>();
         break;
+    // Land-based cabinets: the game launches as ?egmid=EGM1 and the EGM holds the money — balance, bets and wins
+    // go to the EGM's wallet endpoint (config: RGS:Retail:*), and the EGM reports notes, AFT and cash-outs to
+    // api/retail/terminal. See RetailRGSAdapter, RetailController and the "Retail" config.
+    case "Retail":
+        AddOperatorWallet<RetailRGSAdapter>();
+        break;
     // Staging is allowed here (unlike the upstream Worldiator service) so this
     // standalone Feeding Frenzy deployment can run with a fake in-memory wallet
     // and a demo balance for testing — see RGS:Stub:DefaultBalance. Switch
@@ -157,9 +165,9 @@ switch (rgsProvider)
         builder.Services.AddSingleton<IRGSAdapter, StubRGSAdapter>();
         break;
     case "Stub":
-        throw new InvalidOperationException("StubRGSAdapter cannot be used in Production. Set RGS:Provider to Wsb, Operator1, Operator2, or Operator3.");
+        throw new InvalidOperationException("StubRGSAdapter cannot be used in Production. Set RGS:Provider to Retail, Wsb, Operator1, Operator2, or Operator3.");
     default:
-        throw new InvalidOperationException($"Unknown RGS provider \"{rgsProvider}\". Valid values: Wsb, Operator1, Operator2, Operator3 (Stub in Development/Staging only).");
+        throw new InvalidOperationException($"Unknown RGS provider \"{rgsProvider}\". Valid values: Retail, Wsb, Operator1, Operator2, Operator3 (Stub in Development/Staging only).");
 }
 
 // Real operator wallet. In Development/Staging, demo players from /api/dev-token
@@ -179,6 +187,11 @@ void AddOperatorWallet<TAdapter>() where TAdapter : class, IRGSAdapter
         builder.Services.AddTransient<IRGSAdapter>(sp => sp.GetRequiredService<TAdapter>());
     }
 }
+
+// ─── Retail cabinets ─────────────────────────────────────────────────────────
+// Registered for every provider; the api/retail endpoints only answer when RGS:Provider = Retail.
+builder.Services.Configure<RetailOptions>(builder.Configuration.GetSection("Retail"));
+builder.Services.AddSingleton<RetailWalletService>();
 
 // ─── Game Back Office config ─────────────────────────────────────────────────
 // Every game's settings (the catalogue: limits, RNG tables, timings…) and the evolution ladders, edited through
@@ -287,6 +300,15 @@ builder.Services.AddRateLimiter(opt =>
         var game = ctx.RequestServices.GetRequiredService<IGameRegistry>().FindByServerKey(gameKey);
         if (game != null)
             return RateLimitPartition.GetFixedWindowLimiter("game:" + game.GameId, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 6000,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            });
+        // A retail terminal reports for every cabinet on its floor, usually from one address.
+        var terminalKey = ctx.Request.Headers[RetailWalletService.TerminalKeyHeader].ToString();
+        if (ctx.RequestServices.GetRequiredService<RetailWalletService>().IsAnyTerminalKey(terminalKey))
+            return RateLimitPartition.GetFixedWindowLimiter("terminal:" + ctx.Connection.RemoteIpAddress, _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 6000,
                 Window = TimeSpan.FromMinutes(1),
