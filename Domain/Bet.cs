@@ -17,6 +17,12 @@ public class Bet
     public DateTime PlacedAt { get; set; } = DateTime.UtcNow;
     public bool HasGambled { get; set; }
     /// <summary>
+    /// Voided after the player's connection dropped while the bet was still open: the stake went back to them and the
+    /// bet left the round, so nothing may cash it out any more (see GameEngine.RefundOpenBetsAsync).
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool Refunded { get; set; }
+    /// <summary>
     /// Which game the bet was placed from (the session token's "game" claim, e.g. "comet-rider").
     /// Several games share this engine's rounds; this decides which title the wallet books the bet under.
     /// Null / "feeding-frenzy" = Feeding Frenzy.

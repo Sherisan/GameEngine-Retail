@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.SignalR;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using Worldiator.Server.Application;
+using Worldiator.Server.Application.Recovery;
 using Worldiator.Server.Contracts;
 using Worldiator.Server.Presentation.DTOs;
 
@@ -20,15 +21,20 @@ public class GameHub : Hub
 
     private readonly IGameRegistry _games;
 
-    public GameHub(GameEngine engine, IRoundRepository rounds, IRGSAdapter rgs, IGameRegistry games, ILogger<GameHub> logger, IAsyncRoundRepository? db = null)
+    private readonly ConnectionRecovery _recovery;
+
+    public GameHub(GameEngine engine, IRoundRepository rounds, IRGSAdapter rgs, IGameRegistry games, ConnectionRecovery recovery, ILogger<GameHub> logger, IAsyncRoundRepository? db = null)
     {
-        _engine = engine;
-        _games  = games;
-        _rounds = rounds;
-        _rgs    = rgs;
-        _logger = logger;
-        _db     = db;
+        _engine   = engine;
+        _games    = games;
+        _rounds   = rounds;
+        _rgs      = rgs;
+        _recovery = recovery;
+        _logger   = logger;
+        _db       = db;
     }
+
+    private static string RecoveryScope(string? gameId) => "gamehub:" + (gameId ?? SessionTokenService.DefaultGameId);
 
     // Reads player identity from JWT claims — never from client-supplied parameters.
     // 'sub' → playerId, 'name' → username, 'currency' → currency.
@@ -179,6 +185,19 @@ public class GameHub : Hub
             return;
         }
 
+        _recovery.Connected(RecoveryScope(gameId), GetPlayerContext().playerId, Context.ConnectionId);
+        await SendStateAsync();
+        await base.OnConnectedAsync();
+    }
+
+    /// <summary>
+    /// Re-sends ConnectedAs (with the balance) and RoundState to the caller. The client calls it after api/session/recover
+    /// refunded bets that a dropped connection left open, so its slots and balance match the server again.
+    /// </summary>
+    public Task Resync() => SendStateAsync();
+
+    private async Task SendStateAsync()
+    {
         var (playerId, username, currency) = GetPlayerContext();
         decimal balance = 0;
         try { balance = await _rgs.GetBalanceAsync(playerId, currency, GameId); }
@@ -193,6 +212,26 @@ public class GameHub : Hub
             var dto = RoundStateDto.From(round, _engine.GetCurrentBets());
             await Clients.Caller.SendAsync("RoundState", dto);
         }
-        await base.OnConnectedAsync();
+    }
+
+    /// <summary>
+    /// Connection-loss safety: when the player's last connection to this game drops, the bets they still have open in
+    /// the current round are refunded at once (see GameEngine.RefundOpenBetsAsync), and the game is told what was
+    /// refunded when it reconnects (api/session/recover).
+    /// </summary>
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        var playerId = Context.User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                    ?? Context.User?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value;
+        if (playerId != null && _recovery.Disconnected(RecoveryScope(GameId), playerId, Context.ConnectionId))
+        {
+            try
+            {
+                foreach (var bet in await _engine.RefundOpenBetsAsync(playerId, GameId))
+                    _recovery.Notify(playerId, bet);
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Refunding open bets after a lost connection failed for {PlayerId}", playerId); }
+        }
+        await base.OnDisconnectedAsync(exception);
     }
 }

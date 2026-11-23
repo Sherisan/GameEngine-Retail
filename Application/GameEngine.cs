@@ -195,8 +195,9 @@ public class GameEngine
                     // A transient wallet failure (timeout, RGS hiccup) must not silently drop the
                     // auto cash-out — re-queue at the same threshold so the next tick retries it,
                     // instead of leaving the player's bet to ride to a possible crash unannounced.
-                    // A bet a mine already cashed out is settled, so there is nothing to retry.
-                    if (t.IsCompletedSuccessfully && !t.Result.success && pendingBet.CashedOutAt == null)
+                    // A bet a mine already cashed out is settled, and a refunded one has left the round, so there is
+                    // nothing to retry.
+                    if (t.IsCompletedSuccessfully && !t.Result.success && pendingBet.CashedOutAt == null && !pendingBet.Refunded)
                     {
                         lock (_lock) { AddToAutoCashoutQueue(pendingBet); }
                         _logger.LogWarning(
@@ -369,6 +370,7 @@ public class GameEngine
     {
         lock (_lock)
         {
+            if (bet.Refunded) return (false, 0, "The bet was refunded");
             if (bet.CashedOutAt != null) return (false, 0, "Already cashed out");
             // The fish boost is a percentage on top of whatever curve multiplier triggered this cash-out
             // (manual, auto or mine). Both are floored, so rounding never pays above the curve's RTP.
@@ -410,6 +412,78 @@ public class GameEngine
             bet.RoundId, bet.Amount, bet.WinAmount!.Value, freeBet: false);
         if (OnBetCashedOut != null) await OnBetCashedOut(bet);
         return (true, bet.WinAmount!.Value, string.Empty);
+    }
+
+    /// <summary>
+    /// The player's connection to this game dropped (or they came back and the game asked for recovery): every bet they
+    /// still have open in the current round — waiting for take-off, or flying and not cashed out — leaves the round and
+    /// its stake is refunded (a free bet goes back to them). A bet the crash point has already passed has lost and
+    /// stays lost, and one being cashed out is left to finish. Refunding is cashing out at 1.00×, never more than the
+    /// player could have taken themselves, so it can't be used to beat the curve.
+    /// </summary>
+    public async Task<List<Recovery.RecoveredBet>> RefundOpenBetsAsync(string playerId, string? gameId)
+    {
+        var game = gameId ?? SessionTokenService.DefaultGameId;
+        List<Bet> open;
+        lock (_lock)
+        {
+            var round = _currentRound;
+            if (round == null) return [];
+            var riding = round.Phase == GamePhase.Waiting
+                || (round.Phase == GamePhase.Flying
+                    && !PastCrash(round, (DateTime.UtcNow - (round.FlyingStartedAt ?? round.StartedAt)).TotalMilliseconds));
+            if (!riding) return [];
+
+            open = round.Bets.Where(b => b.PlayerId == playerId && b.CashedOutAt == null && !b.Refunded
+                && string.Equals(b.GameId ?? SessionTokenService.DefaultGameId, game, StringComparison.OrdinalIgnoreCase)).ToList();
+            foreach (var bet in open)
+            {
+                bet.Refunded = true;
+                round.Bets.Remove(bet);
+                if (bet.AutoCashOutAt is { } at && _autoCashoutQueue.TryGetValue((double)at, out var queued))
+                {
+                    queued.Remove(bet);
+                    if (queued.Count == 0) _autoCashoutQueue.Remove((double)at);
+                }
+            }
+        }
+
+        var refunded = new List<Recovery.RecoveredBet>();
+        foreach (var bet in open)
+        {
+            if (bet.FreeBet != null)
+                await _promos.ReleaseFreeBetAsync(bet.FreeBet);
+            else if (!await RollbackWithRetryAsync(bet))
+                continue; // logged as CRITICAL — not reported as refunded
+            refunded.Add(new Recovery.RecoveredBet(game, bet.RoundId, "refunded", bet.Amount, bet.Amount, bet.FreeBet != null, bet.SlotIndex));
+            _logger.LogInformation("Bet refunded after a lost connection: game={GameId} player={PlayerId} round={RoundId} slot={Slot} stake={Stake} free={Free}",
+                game, playerId, bet.RoundId, bet.SlotIndex, bet.Amount, bet.FreeBet != null);
+        }
+        return refunded;
+    }
+
+    private async Task<bool> RollbackWithRetryAsync(Bet bet)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                // The operator dedupes by the debit's reference, so a retry can't refund twice.
+                await _rgs.RollbackAsync(bet.PlayerId, bet.DebitTransactionId!, bet.RoundId, bet.GameId, bet.Amount, bet.Currency);
+                return true;
+            }
+            catch (Exception ex) when (attempt < 3)
+            {
+                _logger.LogWarning(ex, "Refund of bet {BetId} failed (attempt {Attempt}) — retrying", bet.BetId, attempt);
+                await Task.Delay(500 * attempt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "CRITICAL: refund after a lost connection FAILED for {PlayerId} bet {BetId} tx:{TxId} round:{RoundId} amount {Amount} — manual refund required",
+                    bet.PlayerId, bet.BetId, bet.DebitTransactionId, bet.RoundId, bet.Amount);
+                return false;
+            }
+        }
     }
 
     private async Task SafeRollbackAsync(string playerId, string txId, string roundId, decimal amount, string currency, string? gameId)

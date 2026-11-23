@@ -107,17 +107,27 @@ builder.Services.AddAuthorization(opt =>
 var redisConnStr = builder.Configuration["Redis:ConnectionString"];
 var redisEnabled = !string.IsNullOrEmpty(redisConnStr);
 
+var signalR = builder.Services.AddSignalR();
 if (redisEnabled)
 {
     var redis = await ConnectionMultiplexer.ConnectAsync(redisConnStr!);
     builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
     builder.Services.AddSingleton<ILeaderElection, RedisLeaderElection>();
-    builder.Services.AddSignalR().AddStackExchangeRedis(redisConnStr!);
+    signalR.AddStackExchangeRedis(redisConnStr!);
 }
-else
+
+// Connection-loss safety: the game hubs ping every 5 s and drop a client silent for 20 s (the defaults are 15 s / 30 s),
+// so a bet left riding by a dead connection is refunded quickly (see ConnectionRecovery). The game clients ping every
+// 5 s and give up on the server after 15 s of silence. The promo hub keeps the defaults.
+void FastLiveness(Microsoft.AspNetCore.SignalR.HubOptions o)
 {
-    builder.Services.AddSignalR();
+    o.KeepAliveInterval     = TimeSpan.FromSeconds(5);
+    o.ClientTimeoutInterval = TimeSpan.FromSeconds(20);
 }
+signalR.AddHubOptions<GameHub>(FastLiveness);
+signalR.AddHubOptions<LiveCrashHub>(FastLiveness);
+signalR.AddHubOptions<MarginCallHub>(FastLiveness);
+builder.Services.AddSingleton<Worldiator.Server.Application.Recovery.ConnectionRecovery>();
 
 // ─── SQL Server persistence ───────────────────────────────────────────────────
 var sqlConnStr = builder.Configuration.GetConnectionString("DefaultConnection");
@@ -420,6 +430,11 @@ app.MapHub<MarginCallHub>("/margincallhub");
 app.MapHub<LiveCrashHub>("/livecrashhub");
 app.MapHub<PromoHub>("/promohub");
 app.MapHealthChecks("/health");
+
+// Connection-loss safety: the games poll this to tell "server reachable" from "connection lost". No database, no auth,
+// so it answers as long as the API process is up (see ConnectionRecovery and api/session/recover).
+app.MapGet("/api/ping", () => Results.Ok(new { ok = true, time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }))
+    .AllowAnonymous();
 
 // Session creation (called by Games-API on game launch) lives in AuthController
 // (api/auth/create-session) and GamesController (api/games/launch).
